@@ -36,7 +36,7 @@
 #include <net/net.h>
 #include <net/netdb.h>
 #include <netinet/in.h>
-SYS_PROCESS_PARAM(1001, 0x200000);
+SYS_PROCESS_PARAM(1001, 0x100000);
 int closesocket(int s);      /* definida en libnet, pero sin prototipo en las cabeceras */
 #else
 #include <time.h>
@@ -65,6 +65,11 @@ int closesocket(int s);      /* definida en libnet, pero sin prototipo en las ca
 #define RING           64
 #define MSG_SIZE       16
 #define NO_FRAME       0xFFFFFFFFu
+
+/* Modos de juego (el menu y config.txt devuelven siempre estos valores) */
+#define MODE_SOLO      0
+#define MODE_HOST      1
+#define MODE_JOIN      2
 
 /* Botones NES (mismo orden que el byte del mando) */
 #define NB_A      0x01
@@ -168,6 +173,15 @@ static uint32_t fnv_u32(uint32_t h, uint32_t v)
 }
 
 static void pump(void);   /* atiende al sistema (boton PS, etc.) */
+
+/* Latido: cada ~2 s escribe en nesnet.log en que fase esta el programa. Si la consola se
+ * cuelga, la ultima linea del log dice cuando y en que fase paso. */
+static const char *g_stage = "inicio";
+static uint32_t    g_hb;
+static void heartbeat(void)
+{
+    if (++g_hb % 120 == 0) logf_("latido %u fase=%s", (unsigned)g_hb, g_stage);
+}
 
 /* ------------------------------------------------------------------ */
 /* Configuracion (config.txt: clave=valor)                             */
@@ -350,6 +364,7 @@ static void ui_clear(void)
 #define CB_SIZE   0x100000
 #define HOST_SIZE (32 * 1024 * 1024)
 #define GCM_LABEL_INDEX 255
+#define LABEL_TEX0      253          /* 253 y 254: una por textura */
 
 static gcmContextData *g_ctx;
 static u32 g_dw, g_dh, g_pitch, g_off[2], g_dpitch, g_doff;
@@ -358,6 +373,7 @@ static u32 *g_cbuf[2], *g_dbuf;
 static u32 *g_tex[2];
 static u32  g_texoff[2];
 static int  g_texsel;
+static u32  g_texval[2];
 static int  g_zoom = 3;
 static padData g_pd[2];
 static uint16_t g_ui_prev;
@@ -451,6 +467,8 @@ static void gpu_init(void)
         g_tex[i] = (u32 *)rsxMemalign(64, SCR_W * SCR_H * 4);
         rsxAddressToOffset(g_tex[i], &g_texoff[i]);
         memset(g_tex[i], 0, SCR_W * SCR_H * 4);
+        g_texval[i] = 0;
+        *(vu32 *)gcmGetLabelAddress(LABEL_TEX0 + i) = 0;
     }
 
     g_zoom = (int)(g_dh / SCR_H);
@@ -484,6 +502,17 @@ static void gpu_blit_canvas(void)
     float zoom = (float)g_zoom;
 
     g_texsel ^= 1;
+
+    /* Esperar a que la GPU termine de leer ESTA textura (la uso cada 2 cuadros) antes de
+     * escribirla otra vez; con tope de ~0,5 s para no quedarse esperando para siempre. */
+    g_stage = "gpu-espera-textura";
+    {
+        int guard = 0;
+        while (*(vu32 *)gcmGetLabelAddress(LABEL_TEX0 + sel) != g_texval[sel] && guard++ < 16000)
+            usleep(30);
+        if (guard >= 16000) logf_("AVISO: la GPU no libero la textura %d a tiempo", sel);
+    }
+    g_stage = "gpu-copia-textura";
     memcpy(g_tex[sel], g_fb, SCR_W * SCR_H * 4);
 
     rsxSetClearColor(g_ctx, 0x00000000);
@@ -523,14 +552,22 @@ static void gpu_blit_canvas(void)
     surface.pitch  = g_pitch;
     surface.offset = g_off[g_cur];
 
+    g_stage = "gpu-encolar-blit";
     rsxSetTransferScaleMode(g_ctx, GCM_TRANSFER_LOCAL_TO_LOCAL, GCM_TRANSFER_SURFACE);
     rsxSetTransferScaleSurface(g_ctx, &scale, &surface);
+
+    /* la GPU escribe esta marca cuando termine el blit de esta textura */
+    g_texval[sel]++;
+    rsxSetWriteBackendLabel(g_ctx, LABEL_TEX0 + sel, g_texval[sel]);
 }
 
 static void present(void)
 {
     gpu_blit_canvas();
+    g_stage = "gpu-flip";
     gpu_flip();
+    g_stage = "ok";
+    heartbeat();
 }
 
 static void sysutil_cb(u64 status, u64 param, void *usrdata)
@@ -553,7 +590,12 @@ static void platform_init(void)
     ioPadInit(7);
     atexit(exit_cb);
     sysUtilRegisterCallback(0, sysutil_cb, NULL);
-    netInitialize();
+}
+
+static void net_ensure(void)
+{
+    static int ready;
+    if (!ready) { logf_("iniciando red"); netInitialize(); ready = 1; logf_("red lista"); }
 }
 
 /* Lee el mando 'port'; conserva el ultimo estado si no hay cambios */
@@ -605,8 +647,27 @@ static uint16_t ui_edges(void)
 #else /* ------------------------- version de pruebas (PC) ------------- */
 
 static void pump(void) {}
-static void present(void) {}
-static uint16_t ui_edges(void) { return 0; }
+static void present(void) { heartbeat(); }
+static void net_ensure(void) {}
+
+/* Pulsaciones simuladas del menu: u d l r = direcciones, x = OK, o = cancelar, s = START */
+static const char *g_ui_script = "";
+static uint16_t ui_edges(void)
+{
+    char c = *g_ui_script;
+    if (!c) return 0;
+    g_ui_script++;
+    switch (c) {
+    case 'u': return UI_UP;
+    case 'd': return UI_DOWN;
+    case 'l': return UI_LEFT;
+    case 'r': return UI_RIGHT;
+    case 'x': return UI_OK;
+    case 'o': return UI_CANCEL;
+    case 's': return UI_START;
+    default:  return 0;
+    }
+}
 static uint16_t pad_nes_bits(int port) { (void)port; return 0; }
 
 /* Mando simulado: determinista por (jugador, frame); cambia cada 6 frames */
@@ -1067,6 +1128,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
     if (role >= 0) for (i = 0; i < D; i++) have[i] = 1;
 
     g_run_hash = 2166136261u; g_frames_done = 0; g_desyncs = 0; g_first_desync = NO_FRAME;
+    g_stage = role == 0 ? "juego-host" : role == 1 ? "juego-cliente" : "juego-local";
 
 #define COMPARE(f) do { uint32_t _f = (f); \
         if (mine_f[_f % RING] == _f && rem_f[_f % RING] == _f && \
@@ -1174,9 +1236,11 @@ static void ui_message(const char *l1, const char *l2, int frames)
 {
     int i;
     for (i = 0; i < frames && g_running; i++) {
+        uint16_t e;
         pump();
         ui_show(l1, l2, NULL);
-        if (ui_edges() & (UI_OK | UI_CANCEL | UI_START)) break;
+        e = ui_edges();
+        if (i > 60 && (e & (UI_OK | UI_CANCEL | UI_START))) break;   /* ~1 s minimo en pantalla */
 #ifdef NESNET_HOST
         sleep_ms(16);
 #endif
@@ -1186,14 +1250,16 @@ static void ui_message(const char *l1, const char *l2, int frames)
 static int ui_menu(void)
 {
     static const char *items[3] = { "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS" };
+    static const int modes[3] = { MODE_HOST, MODE_JOIN, MODE_SOLO };   /* mismo orden que items */
     int sel = 0, i;
+    g_stage = "menu";
     while (g_running) {
         uint16_t e;
         pump();
         e = ui_edges();
         if (e & UI_UP)   sel = (sel + 2) % 3;
         if (e & UI_DOWN) sel = (sel + 1) % 3;
-        if (e & (UI_OK | UI_START)) return sel;
+        if (e & (UI_OK | UI_START)) return modes[sel];
         ui_clear();
         ui_center(20, "NESNET V1", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
@@ -1277,6 +1343,8 @@ static int run_host(void)
     char code[20], l2[48];
     int lfd, D = 0;
 
+    net_ensure();
+    g_stage = "buscando-ip";
     ui_show("CREANDO SALA...", "BUSCANDO TU IP PUBLICA", NULL);
     if (g_cfg.public_ip[0] && parse_ip(g_cfg.public_ip, &ip)) { /* IP fijada a mano */ }
     else if (!get_public_ip(&ip)) { g_err = "NO PUDE OBTENER TU IP PUBLICA"; return 0; }
@@ -1289,6 +1357,7 @@ static int run_host(void)
     if (lfd < 0) { g_err = "NO PUDE ABRIR EL PUERTO"; return 0; }
 
     snprintf(l2, sizeof l2, "PUERTO %d", g_cfg.port);
+    g_stage = "esperando-amigo";
     for (;;) {
         uint16_t e;
         pump();
@@ -1331,6 +1400,8 @@ static int run_client(void)
     else if (!ui_enter_code(code)) { g_err = ""; return 1; }
 
     if (!code_decode(code, &ip, &port)) { g_err = "CODIGO INVALIDO"; return 0; }
+    net_ensure();
+    g_stage = "conectando";
     {
         char l2[48];
         snprintf(l2, sizeof l2, "%u.%u.%u.%u:%d", (unsigned)(ip >> 24), (unsigned)((ip >> 16) & 255),
@@ -1347,7 +1418,7 @@ static int run_client(void)
 static int run_solo(void)
 {
     if (!core_load()) return 0;
-    session_loop(-1, 0, 0);
+    session_loop(-1, 0, g_maxframes);
     core_unload();
     return 1;
 }
@@ -1390,15 +1461,16 @@ static int app_main(const char *argv0)
     while (g_running) {
         int ok = 1;
         if (from_cfg) {
-            choice = !strcmp(g_cfg.mode, "host") ? 1 : !strcmp(g_cfg.mode, "client") ? 2 :
-                     !strcmp(g_cfg.mode, "local") ? 0 : -1;
+            choice = !strcmp(g_cfg.mode, "host") ? MODE_HOST : !strcmp(g_cfg.mode, "client") ? MODE_JOIN :
+                     !strcmp(g_cfg.mode, "local") ? MODE_SOLO : -1;
             from_cfg = 0;                 /* despues de la primera vez, usa el menu */
         }
         if (choice < 0) choice = ui_menu();
         if (choice < 0) break;
+        logf_("modo elegido: %s", choice == MODE_SOLO ? "SOLO (2 mandos)" : choice == MODE_HOST ? "CREAR SALA (host)" : "UNIRSE (cliente)");
         g_err = "";
-        if (choice == 0) ok = run_solo();
-        else if (choice == 1) ok = run_host();
+        if (choice == MODE_SOLO) ok = run_solo();
+        else if (choice == MODE_HOST) ok = run_host();
         else ok = run_client();
         choice = -1;
 #ifdef NESNET_HOST
@@ -1490,6 +1562,7 @@ int main(int argc, char **argv)
         char exe[300];
         int rc;
         snprintf(exe, sizeof exe, "%s/EBOOT.BIN", argv[4]);
+        if (getenv("NESNET_UI")) g_ui_script = getenv("NESNET_UI");
         rc = app_main(exe);
         printf("RESULT mode=app frames=%u hash=%08X desyncs=%d rc=%d\n", (unsigned)g_frames_done,
                (unsigned)g_run_hash, g_desyncs, rc);
