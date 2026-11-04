@@ -103,6 +103,12 @@ jobs:
           public_ip=
           # code: codigo de sala para el cliente (si se deja vacio se escribe con el mando)
           code=
+          # res: vacio = la de tu TV | 720 = forzar 720p (prueba si tu TV es 1080p y se cuelga)
+          res=
+          # render: vacio = GPU | cpu = dibujo directo sin la GPU (prueba de cuelgues)
+          render=
+          # zoom: vacio = automatico (1, 2, 3 o 4)
+          zoom=
           EOF
           sed -i 's/^          //' data/USRDIR/config.txt
           cat data/USRDIR/config.txt
@@ -121,4 +127,3 @@ jobs:
             NesNet.pkg
             NesNet.gnpdrm.pkg
           if-no-files-found: error
-          
