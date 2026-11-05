@@ -103,9 +103,9 @@ jobs:
           public_ip=
           # code: codigo de sala para el cliente (si se deja vacio se escribe con el mando)
           code=
-          # res: vacio = la de tu TV | 720 = forzar 720p (prueba si tu TV es 1080p y se cuelga)
+          # res: vacio = 720p (por defecto) | auto = la resolucion de tu TV
           res=
-          # render: vacio = GPU | cpu = dibujo directo sin la GPU (prueba de cuelgues)
+          # render: vacio = cpu (por defecto, dibujo directo sin la GPU) | gpu = usa la GPU (se colgo en las pruebas)
           render=
           # zoom: vacio = automatico (1, 2, 3 o 4)
           zoom=
