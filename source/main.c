@@ -194,6 +194,8 @@ static void cfg_defaults(void)
     memset(&g_cfg, 0, sizeof g_cfg);
     snprintf(g_cfg.rom, sizeof g_cfg.rom, "%s/rom.nes", g_dir);
     g_cfg.port = DEFAULT_PORT;
+    g_cfg.res = 720;                      /* v1.3: por defecto 720p (probado en la PS3) */
+    g_cfg.render = 1;                     /* v1.3: por defecto dibujo por CPU, sin la GPU (la ruta GPU se colgo 3 veces) */
 }
 
 static void cfg_load(void)
@@ -225,8 +227,8 @@ static void cfg_load(void)
         else if (!strcmp(k, "public_ip")) snprintf(g_cfg.public_ip, sizeof g_cfg.public_ip, "%s", v);
         else if (!strcmp(k, "delay"))     g_cfg.delay = atoi(v);
         else if (!strcmp(k, "port"))      g_cfg.port = atoi(v);
-        else if (!strcmp(k, "res"))       g_cfg.res = !strcmp(v, "720") ? 720 : 0;
-        else if (!strcmp(k, "render"))    g_cfg.render = !strcmp(v, "cpu") ? 1 : 0;
+        else if (!strcmp(k, "res"))       { if (!strcmp(v, "auto")) g_cfg.res = 0; else if (!strcmp(v, "720")) g_cfg.res = 720; }
+        else if (!strcmp(k, "render"))    { if (!strcmp(v, "gpu")) g_cfg.render = 0; else if (!strcmp(v, "cpu")) g_cfg.render = 1; }
         else if (!strcmp(k, "zoom"))      g_cfg.zoom = atoi(v);
     }
     fclose(f);
@@ -497,7 +499,7 @@ static void gpu_init(void)
     }
 
     g_zoom = (int)(g_dh / SCR_H);
-    if (g_cfg.render && g_zoom > 2) g_zoom = 2;      /* escribir a mano en la VRAM es lento: x2 maximo */
+    if (g_cfg.render && g_zoom > 3) g_zoom = 3;      /* escribir a mano en la VRAM es lento: x3 maximo (v1.3; antes x2) */
     if (g_cfg.zoom > 0 && g_cfg.zoom < g_zoom) g_zoom = g_cfg.zoom;
     if (g_zoom < 1) g_zoom = 1;
     if (g_zoom > 4) g_zoom = 4;
@@ -539,13 +541,30 @@ static void gpu_blit_canvas(void)
     if (g_cfg.render) {
         /* Modo CPU: sin transferencia ni clear ni blend de la GPU; escribo directo en el buffer de pantalla */
         static u32 row[SCR_W * 4];
+        static unsigned cpu_frame;
         int z = g_zoom, x, y, k;
-        u32 *dst = g_cbuf[g_cur] + ((g_dh - SCR_H * z) / 2) * g_dw + (g_dw - SCR_W * z) / 2;
+        int ox = (int)(g_dw - SCR_W * z) / 2, oy = (int)(g_dh - SCR_H * z) / 2;
+        u32 *dst = g_cbuf[g_cur] + oy * g_dw + ox;
         if (!g_first) {
             int guard = 0;
             while (gcmGetFlipStatus() != 0 && guard++ < 15000) usleep(200);
         }
         g_stage = "cpu-copia";
+        /* v1.3: limpia cada 4 cuadros lo que queda fuera del juego (bordes) para que no se quede el
+         * residuo del XMB (reloj / bateria del mando); el juego mismo se repinta siempre. */
+        if ((cpu_frame++ & 3) == 0) {
+            u32 *base = g_cbuf[g_cur];
+            int below = (int)g_dh - oy - SCR_H * z;
+            if (oy > 0) memset(base, 0, (size_t)oy * g_dw * 4);
+            if (below > 0) memset(base + (size_t)(oy + SCR_H * z) * g_dw, 0, (size_t)below * g_dw * 4);
+            if (ox > 0) {
+                int right = (int)g_dw - ox - SCR_W * z;
+                for (y = oy; y < oy + SCR_H * z; y++) {
+                    memset(base + (size_t)y * g_dw, 0, (size_t)ox * 4);
+                    if (right > 0) memset(base + (size_t)y * g_dw + ox + SCR_W * z, 0, (size_t)right * 4);
+                }
+            }
+        }
         for (y = 0; y < SCR_H; y++) {
             const u32 *src = g_fb + y * SCR_W;
             for (x = 0; x < SCR_W; x++) for (k = 0; k < z; k++) row[x * z + k] = src[x];
@@ -1498,7 +1517,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("NesNet v1.2 - dir=%s", g_dir);
+    logf_("NesNet v1.3 - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom);
 }
