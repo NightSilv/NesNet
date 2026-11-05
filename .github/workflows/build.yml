@@ -109,6 +109,8 @@ jobs:
           render=
           # zoom: vacio = automatico (1, 2, 3 o 4)
           zoom=
+          # audio: vacio = con sonido | off = sin sonido (tambien se apaga manteniendo R2 al abrir)
+          audio=
           EOF
           sed -i 's/^          //' data/USRDIR/config.txt
           cat data/USRDIR/config.txt
