@@ -31,6 +31,7 @@
 #include <rsx/rsx.h>
 #include <sysutil/sysutil.h>
 #include <sysutil/video.h>
+#include <audio/audio.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <net/net.h>
@@ -103,6 +104,7 @@ typedef struct {
     int      res;             /* 0 = la de la TV, 720 = forzar 720p */
     int      render;          /* 0 = GPU (escalado), 1 = CPU directo (sin transferencia GPU) */
     int      zoom;            /* 0 = automatico */
+    int      audio;           /* 1 = con sonido (por defecto), 0 = sin sonido */
 } Config;
 
 static Config   g_cfg;
@@ -195,6 +197,7 @@ static void cfg_defaults(void)
     snprintf(g_cfg.rom, sizeof g_cfg.rom, "%s/rom.nes", g_dir);
     g_cfg.port = DEFAULT_PORT;
     g_cfg.res = 720;                      /* v1.3: por defecto 720p (probado en la PS3) */
+    g_cfg.audio = 1;                      /* v1.5: sonido activado por defecto (audio=off o R2 al abrir lo apaga) */
     g_cfg.render = 1;                     /* v1.3: por defecto dibujo por CPU, sin la GPU (la ruta GPU se colgo 3 veces) */
 }
 
@@ -230,6 +233,7 @@ static void cfg_load(void)
         else if (!strcmp(k, "res"))       { if (!strcmp(v, "auto")) g_cfg.res = 0; else if (!strcmp(v, "720")) g_cfg.res = 720; }
         else if (!strcmp(k, "render"))    { if (!strcmp(v, "gpu")) g_cfg.render = 0; else if (!strcmp(v, "cpu")) g_cfg.render = 1; }
         else if (!strcmp(k, "zoom"))      g_cfg.zoom = atoi(v);
+        else if (!strcmp(k, "audio"))     { if (!strcmp(v, "off")) g_cfg.audio = 0; else if (!strcmp(v, "on")) g_cfg.audio = 1; }
     }
     fclose(f);
     if (g_cfg.port <= 0 || g_cfg.port > 65535) g_cfg.port = DEFAULT_PORT;
@@ -367,6 +371,248 @@ static void ui_clear(void)
 /* ------------------------------------------------------------------ */
 /* Plataforma: video, mando                                            */
 /* ------------------------------------------------------------------ */
+/* ------------------------------------------------------------------ */
+/* Audio (v1.5)                                                        */
+/* El nucleo entrega PCM de 16 bits estereo. Se re-muestrea a 48 kHz con un ajuste fino de   */
+/* velocidad (maximo +-1 %) para seguir el reloj de la consola, y se escribe en el anillo de */
+/* bloques de libaudio. Ninguna espera es bloqueante: si algo falla, el juego sigue sin sonido. */
+/* ------------------------------------------------------------------ */
+#define AU_BLK       256            /* muestras por bloque (AUDIO_BLOCK_SAMPLES) */
+#define AU_NBLK      32             /* bloques del anillo (AUDIO_BLOCK_32, ~170 ms) */
+#define AU_TARGET    8              /* bloques por delante que intento mantener (~43 ms) */
+#define AU_PRIME     6              /* tras un corte, relleno con silencio hasta este nivel */
+#define AU_URGENT    2              /* si no hay audio, mantengo al menos esto con silencio */
+#define AU_QCAP      8192           /* cola de entrada (cuadros estereo) */
+#define AU_OUT_RATE  48000.0
+#define AU_FILL_T    (AU_TARGET * AU_BLK + 800.0)
+
+static int      g_au_on;                    /* 1 = audio activo */
+static double   g_au_inrate = 48000.0;      /* frecuencia que entrega el nucleo */
+static int16_t  g_aq[AU_QCAP * 2];
+static unsigned g_aq_head, g_aq_cnt;        /* cola circular de entrada (cuadros) */
+static double   g_aq_pos;                   /* posicion fraccionaria respecto a head */
+static float    g_au_ll, g_au_lr;           /* ultima muestra emitida (para el fundido a silencio) */
+static int      g_au_queued;                /* bloques escritos por delante de la lectura */
+static int      g_au_reprime;
+static uint32_t g_au_lastrd, g_au_lastpush, g_au_lastpump, g_au_logt;
+static uint32_t g_au_blocks, g_au_under, g_au_drop;
+static double   g_au_step_s = 1.0;          /* paso suavizado */
+
+#ifdef NESNET_PS3
+static u32  g_au_port;
+static audioPortConfig g_au_cfg;
+static sys_event_queue_t g_au_q;
+static sys_ipc_key_t g_au_key;
+static int  g_au_init, g_au_portok, g_au_qok, g_au_started;
+
+static uint32_t au_hw_readidx(void) { return (uint32_t)(*(volatile u64 *)(uintptr_t)g_au_cfg.readIndex); }
+static float *au_hw_block(uint32_t i) { return (float *)(uintptr_t)g_au_cfg.audioDataStart + (size_t)i * AU_BLK * 2; }
+static void au_hw_poll(void) { if (g_au_qok) sysEventQueueDrain(g_au_q); }
+
+static void au_close(void)
+{
+    g_au_on = 0;
+    if (g_au_started) { audioPortStop(g_au_port); g_au_started = 0; }
+    if (g_au_qok) { audioRemoveNotifyEventQueue(g_au_key); sysEventQueueDestroy(g_au_q, 0); g_au_qok = 0; }
+    if (g_au_portok) { audioPortClose(g_au_port); g_au_portok = 0; }
+    if (g_au_init) { audioQuit(); g_au_init = 0; }
+}
+#else
+static uint32_t au_hw_readidx(void) { return 0; }
+static float *au_hw_block(uint32_t i) { static float b[AU_BLK * 2]; (void)i; return b; }
+static void au_hw_poll(void) {}
+static void au_close(void) {}
+#endif
+
+/* AUDIO-GENERIC-BEGIN */
+static void au_reset(void)
+{
+    g_aq_head = 0; g_aq_cnt = 0; g_aq_pos = 0.0;
+}
+
+/* Recibe PCM del nucleo (se llama desde retro_run) */
+static void au_push(const int16_t *d, size_t frames)
+{
+    size_t i;
+    if (!g_au_on || !frames) return;
+    g_au_lastpush = now_ms();
+    if (frames > AU_QCAP) { d += (frames - AU_QCAP) * 2; frames = AU_QCAP; }
+    if (g_aq_cnt + frames > AU_QCAP) {              /* la cola se llena: descarto lo mas viejo */
+        unsigned over = (unsigned)(g_aq_cnt + frames - AU_QCAP);
+        if (over > g_aq_cnt) over = g_aq_cnt;
+        g_aq_head = (g_aq_head + over) % AU_QCAP;
+        g_aq_cnt -= over;
+        g_aq_pos -= (double)over;
+        if (g_aq_pos < 0.0) g_aq_pos = 0.0;
+        g_au_drop++;
+    }
+    for (i = 0; i < frames; i++) {
+        unsigned w = (g_aq_head + g_aq_cnt) % AU_QCAP;
+        g_aq[w * 2]     = d[i * 2];
+        g_aq[w * 2 + 1] = d[i * 2 + 1];
+        g_aq_cnt++;
+    }
+}
+
+/* Paso de lectura de la entrada por cada muestra de salida: nominal +- 1 %, segun cuanto audio
+ * hay acumulado (en la cola de salida + en la de entrada) respecto al objetivo. */
+static double au_calc_step(void)
+{
+    double base = g_au_inrate / AU_OUT_RATE;
+    double fill = (double)g_au_queued * AU_BLK + (double)g_aq_cnt / base;
+    double e = (fill - AU_FILL_T) / AU_FILL_T;
+    double s;
+    if (e > 1.0) e = 1.0; else if (e < -1.0) e = -1.0;
+    s = base * (1.0 + 0.01 * e);
+    g_au_step_s += 0.05 * (s - g_au_step_s);
+    if (g_au_step_s > base * 1.01) g_au_step_s = base * 1.01;
+    if (g_au_step_s < base * 0.99) g_au_step_s = base * 0.99;
+    return g_au_step_s;
+}
+
+static void au_silence_block(float *o)
+{
+    int i;
+    for (i = 0; i < AU_BLK; i++) {
+        g_au_ll *= 0.995f; g_au_lr *= 0.995f;
+        if (g_au_ll > -1e-6f && g_au_ll < 1e-6f) g_au_ll = 0.0f;
+        if (g_au_lr > -1e-6f && g_au_lr < 1e-6f) g_au_lr = 0.0f;
+        o[i * 2] = g_au_ll; o[i * 2 + 1] = g_au_lr;
+    }
+}
+
+/* Un bloque real: interpolacion lineal entre muestras de entrada. El que llama garantiza que
+ * hay suficiente entrada (au_need). */
+static int au_need(double step) { return (int)(g_aq_pos + AU_BLK * step) + 2; }
+
+static void au_real_block(float *o, double step)
+{
+    int i, n;
+    for (i = 0; i < AU_BLK; i++) {
+        int k = (int)g_aq_pos;
+        double fr = g_aq_pos - (double)k;
+        unsigned a = (g_aq_head + (unsigned)k) % AU_QCAP, b = (g_aq_head + (unsigned)k + 1) % AU_QCAP;
+        double l = (double)g_aq[a * 2]     + ((double)g_aq[b * 2]     - (double)g_aq[a * 2])     * fr;
+        double r = (double)g_aq[a * 2 + 1] + ((double)g_aq[b * 2 + 1] - (double)g_aq[a * 2 + 1]) * fr;
+        g_au_ll = (float)(l / 32768.0); g_au_lr = (float)(r / 32768.0);
+        o[i * 2] = g_au_ll; o[i * 2 + 1] = g_au_lr;
+        g_aq_pos += step;
+    }
+    n = (int)g_aq_pos;
+    if (n > (int)g_aq_cnt) n = (int)g_aq_cnt;
+    g_aq_head = (g_aq_head + (unsigned)n) % AU_QCAP;
+    g_aq_cnt -= (unsigned)n;
+    g_aq_pos -= (double)n;
+    if (g_aq_pos < 0.0) g_aq_pos = 0.0;
+}
+
+/* Se llama muy seguido (desde pump()): repone bloques en el anillo segun avance el reloj de audio */
+static void au_pump(void)
+{
+    uint32_t rd, now;
+    int d, idle, guard = 0;
+    double step;
+    if (!g_au_on) return;
+    now = now_ms();
+    idle = (uint32_t)(now - g_au_lastpush) > 500;
+    au_hw_poll();
+    if (g_au_lastpump && (uint32_t)(now - g_au_lastpump) > 120) {
+        /* el programa estuvo detenido: el anillo pudo dar la vuelta; lo dejo en silencio y empiezo de nuevo */
+        int j;
+        for (j = 0; j < AU_NBLK; j++) memset(au_hw_block((uint32_t)j), 0, AU_BLK * 2 * sizeof(float));
+        g_au_queued = 0; g_au_reprime = 1;
+        g_au_lastrd = au_hw_readidx() % AU_NBLK;
+        if (!idle) g_au_under++;
+    }
+    g_au_lastpump = now;
+    rd = au_hw_readidx() % AU_NBLK;
+    d = (int)((rd + AU_NBLK - g_au_lastrd) % AU_NBLK);
+    if (d > 0) {
+        int j;
+        for (j = 0; j < d; j++) memset(au_hw_block((g_au_lastrd + (uint32_t)j) % AU_NBLK), 0, AU_BLK * 2 * sizeof(float));
+        if (d > g_au_queued) { if (!idle) { g_au_under++; g_au_reprime = 1; } g_au_queued = 0; }
+        else g_au_queued -= d;
+        g_au_lastrd = rd;
+    }
+    step = au_calc_step();
+    while (g_au_queued < AU_TARGET && guard++ < AU_NBLK) {
+        float *o = au_hw_block((rd + 1 + (uint32_t)g_au_queued) % AU_NBLK);
+        if (g_au_reprime && g_au_queued < AU_PRIME) {
+            au_silence_block(o);
+            if (g_au_queued + 1 >= AU_PRIME) g_au_reprime = 0;
+        } else if ((int)g_aq_cnt >= au_need(step)) {
+            au_real_block(o, step);
+            g_au_blocks++;
+        } else if (g_au_queued < AU_URGENT) {
+            au_silence_block(o);
+        } else break;
+        g_au_queued++;
+    }
+    if (!idle && (uint32_t)(now - g_au_logt) >= 2000) {
+        g_au_logt = now;
+        logf_("audio: bloques=%u cortes=%u descartes=%u cola=%d entrada=%u paso=%d/10000",
+              (unsigned)g_au_blocks, (unsigned)g_au_under, (unsigned)g_au_drop,
+              g_au_queued, (unsigned)g_aq_cnt, (int)(step * 10000.0));
+    }
+}
+/* AUDIO-GENERIC-END */
+
+#ifdef NESNET_PS3
+static void au_open(void)
+{
+    audioPortParam pr;
+    s32 r;
+    g_au_on = 0;
+    if (!g_cfg.audio) { logf_("audio: apagado (audio=off o R2 al abrir)"); return; }
+    logf_("audio: llamando a audioInit...");
+    r = audioInit();
+    logf_("audio: audioInit=%08x", (unsigned)r);
+    if (r != 0) return;
+    g_au_init = 1;
+    memset(&pr, 0, sizeof pr);
+    pr.numChannels = AUDIO_PORT_2CH;
+    pr.numBlocks   = AUDIO_BLOCK_32;
+    pr.attrib      = AUDIO_PORT_INITLEVEL;
+    pr.level       = 1.0f;
+    logf_("audio: llamando a audioPortOpen...");
+    r = audioPortOpen(&pr, &g_au_port);
+    logf_("audio: audioPortOpen=%08x puerto=%u", (unsigned)r, (unsigned)g_au_port);
+    if (r != 0) { au_close(); return; }
+    g_au_portok = 1;
+    r = audioGetPortConfig(g_au_port, &g_au_cfg);
+    logf_("audio: config=%08x bloques=%u canales=%u indice=%08x datos=%08x", (unsigned)r,
+          (unsigned)g_au_cfg.numBlocks, (unsigned)g_au_cfg.channelCount,
+          (unsigned)g_au_cfg.readIndex, (unsigned)g_au_cfg.audioDataStart);
+    if (r != 0 || g_au_cfg.numBlocks != AU_NBLK || g_au_cfg.channelCount != 2 ||
+        !g_au_cfg.readIndex || !g_au_cfg.audioDataStart) {
+        logf_("AVISO: el puerto de audio no tiene el formato esperado; sigo sin sonido");
+        au_close(); return;
+    }
+    r = audioCreateNotifyEventQueue(&g_au_q, &g_au_key);
+    logf_("audio: cola de eventos=%08x", (unsigned)r);
+    if (r == 0) {
+        g_au_qok = 1;
+        r = audioSetNotifyEventQueue(g_au_key);
+        logf_("audio: audioSetNotifyEventQueue=%08x", (unsigned)r);
+        sysEventQueueDrain(g_au_q);
+    } else {
+        logf_("AVISO: sin cola de eventos de audio; sigo leyendo el indice directamente");
+    }
+    { int i; for (i = 0; i < AU_NBLK; i++) memset(au_hw_block((uint32_t)i), 0, AU_BLK * 2 * sizeof(float)); }
+    g_au_lastrd = au_hw_readidx() % AU_NBLK;
+    g_au_queued = 0; g_au_reprime = 1; g_au_lastpush = 0; g_au_lastpump = 0;
+    logf_("audio: llamando a audioPortStart...");
+    r = audioPortStart(g_au_port);
+    logf_("audio: audioPortStart=%08x", (unsigned)r);
+    if (r != 0) { au_close(); return; }
+    g_au_started = 1;
+    g_au_on = 1;
+    logf_("audio: listo (anillo de %d bloques)", AU_NBLK);
+}
+#else
+static void au_open(void) {}
+#endif
+
 #ifdef NESNET_PS3
 
 #define CB_SIZE   0x100000
@@ -541,7 +787,7 @@ static void gpu_blit_canvas(void)
     if (g_cfg.render) {
         /* Modo CPU: sin transferencia ni clear ni blend de la GPU; escribo directo en el buffer de pantalla */
         static u32 row[SCR_W * 4];
-        static unsigned cpu_frame;
+        static unsigned cpu_frame[2];     /* un contador por buffer de pantalla (v1.4) */
         int z = g_zoom, x, y, k;
         int ox = (int)(g_dw - SCR_W * z) / 2, oy = (int)(g_dh - SCR_H * z) / 2;
         u32 *dst = g_cbuf[g_cur] + oy * g_dw + ox;
@@ -550,9 +796,9 @@ static void gpu_blit_canvas(void)
             while (gcmGetFlipStatus() != 0 && guard++ < 15000) usleep(200);
         }
         g_stage = "cpu-copia";
-        /* v1.3: limpia cada 4 cuadros lo que queda fuera del juego (bordes) para que no se quede el
+        /* v1.3: limpia cada 4 cuadros DE CADA BUFFER lo que queda fuera del juego (bordes) para que no se quede el
          * residuo del XMB (reloj / bateria del mando); el juego mismo se repinta siempre. */
-        if ((cpu_frame++ & 3) == 0) {
+        if ((cpu_frame[g_cur & 1]++ & 3) == 0) {
             u32 *base = g_cbuf[g_cur];
             int below = (int)g_dh - oy - SCR_H * z;
             if (oy > 0) memset(base, 0, (size_t)oy * g_dw * 4);
@@ -648,11 +894,12 @@ static void sysutil_cb(u64 status, u64 param, void *usrdata)
     if (status == SYSUTIL_EXIT_GAME) g_running = 0;
 }
 
-static void pump(void) { sysUtilCheckCallback(); }
+static void pump(void) { sysUtilCheckCallback(); au_pump(); }
 
 static void exit_cb(void)
 {
     sysUtilUnregisterCallback(SYSUTIL_EVENT_SLOT0);
+    au_close();
     if (g_ctx) { gcmSetWaitFlip(g_ctx); rsxFinish(g_ctx, 1); }
 }
 
@@ -810,8 +1057,8 @@ static void video_cb(const void *data, unsigned w, unsigned h, size_t pitch)
     g_frame_crc = hsh;
 }
 
-static void audio_cb(int16_t l, int16_t r) { (void)l; (void)r; }
-static size_t audio_batch_cb(const int16_t *d, size_t frames) { (void)d; return frames; }
+static void audio_cb(int16_t l, int16_t r) { int16_t s2[2]; s2[0] = l; s2[1] = r; au_push(s2, 1); }
+static size_t audio_batch_cb(const int16_t *d, size_t frames) { au_push(d, frames); return frames; }
 static void input_poll_cb(void) {}
 static int16_t input_state_cb(unsigned port, unsigned dev, unsigned idx, unsigned id)
 {
@@ -870,6 +1117,13 @@ static int core_load(void)
     if (!retro_load_game(&gi)) { g_err = "EL NUCLEO NO PUDO CARGAR LA ROM"; return 0; }
     retro_set_controller_port_device(0, RETRO_DEVICE_JOYPAD);
     retro_set_controller_port_device(1, RETRO_DEVICE_JOYPAD);
+    {
+        struct retro_system_av_info av;
+        memset(&av, 0, sizeof av);
+        retro_get_system_av_info(&av);
+        if (av.timing.sample_rate >= 8000.0 && av.timing.sample_rate <= 96000.0) g_au_inrate = av.timing.sample_rate;
+        logf_("audio: el nucleo entrega %d Hz a %d cuadros/s", (int)g_au_inrate, (int)(av.timing.fps + 0.5));
+    }
     g_core_loaded = 1;
     return 1;
 }
@@ -1296,7 +1550,7 @@ out:
 static void ui_show(const char *l1, const char *l2, const char *l3)
 {
     ui_clear();
-    ui_center(20, "NESNET V1.2", 2, 0xFFFFD040);
+    ui_center(20, "NESNET V1.5", 2, 0xFFFFD040);
     if (l1) ui_center(90, l1, 1, 0xFFFFFFFF);
     if (l2) ui_center(110, l2, 1, 0xFFC0C0FF);
     if (l3) ui_center(130, l3, 1, 0xFFC0C0FF);
@@ -1332,7 +1586,7 @@ static int ui_menu(void)
         if (e & UI_DOWN) sel = (sel + 1) % 3;
         if (e & (UI_OK | UI_START)) return modes[sel];
         ui_clear();
-        ui_center(20, "NESNET V1.2", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.5", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         for (i = 0; i < 3; i++) {
             char line[40];
@@ -1370,7 +1624,7 @@ static int ui_enter_code(char *out)
         for (i = 0; i < 15; i++) digits[i] = (char)('0' + d[i]);
         digits[15] = 0;
         ui_clear();
-        ui_center(20, "NESNET V1.2", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.5", 2, 0xFFFFD040);
         ui_center(60, "ESCRIBE EL CODIGO DEL HOST", 1, 0xFFFFFFFF);
         for (i = 0; i < 15; i++) {
             char c[2] = { digits[i], 0 };
@@ -1436,7 +1690,7 @@ static int run_host(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.2", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.5", 2, 0xFFFFD040);
         ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
         ui_center(84, code, 2, 0xFFFFFF40);
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -1517,9 +1771,9 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("NesNet v1.3 - dir=%s", g_dir);
+    logf_("NesNet v1.5 - dir=%s", g_dir);
     cfg_load();
-    logf_("config: res=%d render=%s zoom=%d", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom);
+    logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
 }
 
 static int app_main(const char *argv0)
@@ -1565,6 +1819,7 @@ static int app_main(const char *argv0)
         }
     }
     logf_("salida");
+    au_close();
     retro_deinit();
     if (g_log) fclose(g_log);
     return 0;
@@ -1582,11 +1837,13 @@ int main(int argc, const char *argv[])
             padData *d = pad_read(0);
             if (d->BTN_L1) { g_cfg.res = 720; }
             if (d->BTN_R1) { g_cfg.render = 1; }
+            if (d->BTN_R2) { g_cfg.audio = 0; }
             usleep(20000);
         }
         if (g_cfg.res || g_cfg.render) logf_("config final: res=%d render=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu");
     }
     platform_init();
+    au_open();
     return app_main(argc > 0 ? argv[0] : NULL);
 }
 #endif
@@ -1623,7 +1880,7 @@ int main(int argc, char **argv)
         static const char *items[3] = { "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS" };
         int i;
         ui_clear();
-        ui_center(20, "NESNET V1.2", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.5", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         for (i = 0; i < 3; i++) {
             char line[40];
@@ -1635,7 +1892,7 @@ int main(int argc, char **argv)
             char code[20];
             code_encode(((uint32_t)181 << 24) | (45u << 16) | (200u << 8) | 17u, 7777, code);
             ui_clear();
-            ui_center(20, "NESNET V1.2", 2, 0xFFFFD040);
+            ui_center(20, "NESNET V1.5", 2, 0xFFFFD040);
             ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
             ui_center(84, code, 2, 0xFFFFFF40);
             ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
