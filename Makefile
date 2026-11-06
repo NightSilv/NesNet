@@ -21,7 +21,7 @@ CFLAGS   = -O2 -Wall -std=gnu99 -mcpu=cell $(MACHDEP) -DNESNET_PS3 \
 LDFLAGS  = $(MACHDEP)
 
 LIBS     = fceumm/fceumm_libretro_psl1ght.a \
-           -lrsx -lgcm_sys -lio -laudio -lsysutil -lnet -lsysmodule -lrt -llv2 -lm
+           -lrsx -lgcm_sys -lio -laudio -lsysutil -lnetctl -lnet -lsysmodule -lrt -llv2 -lm
 
 # Todo lo que haya en data/ se copia dentro del .pkg (data/USRDIR/config.txt)
 PKGFILES = data
