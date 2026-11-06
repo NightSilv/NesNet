@@ -18,6 +18,7 @@
 #include <stdarg.h>
 #include <unistd.h>
 #include <errno.h>
+#include <dirent.h>
 #include <sys/stat.h>
 
 #include "libretro.h"
@@ -73,6 +74,11 @@ int closesocket(int s);      /* definida en libnet, pero sin prototipo en las ca
 #define MODE_SOLO      0
 #define MODE_HOST      1
 #define MODE_JOIN      2
+#define MODE_ROM       3      /* v1.7: opcion "ELEGIR ROM" del menu (no es un modo de juego) */
+
+/* v1.7: selector de ROMs. Las ROMs van en USRDIR/roms/ y se reconocen por su cabecera, no por el nombre */
+#define ROM_MAX        256
+#define ROM_NAMELEN    96
 
 /* Botones NES (mismo orden que el byte del mando) */
 #define NB_A      0x01
@@ -97,7 +103,7 @@ int closesocket(int s);      /* definida en libnet, pero sin prototipo en las ca
 /* Estado global                                                       */
 /* ------------------------------------------------------------------ */
 typedef struct {
-    char     rom[256];
+    char     rom[420];        /* v1.7: ruta de la ROM elegida en el selector (ya no sale de config.txt) */
     char     mode[16];        /* "", "host", "client", "local" */
     char     code[32];
     char     public_ip[32];
@@ -116,9 +122,11 @@ static FILE    *g_log;
 static int      g_running = 1;
 static const char *g_err = "";
 
-static uint8_t *g_rom;
+static uint8_t *g_rom;                    /* NULL = ninguna ROM elegida (stand-by) */
 static size_t   g_romsz;
 static uint32_t g_romcrc;
+static char     g_rom_name[ROM_NAMELEN];  /* v1.7: nombre del archivo de la ROM elegida */
+static int      g_menu_sel;               /* v1.7: opcion marcada del menu principal */
 
 static uint32_t g_fb[SCR_W * SCR_H];      /* lienzo ARGB */
 static uint16_t g_pad[2];                 /* entrada NES que ve el nucleo */
@@ -197,7 +205,6 @@ static void heartbeat(void)
 static void cfg_defaults(void)
 {
     memset(&g_cfg, 0, sizeof g_cfg);
-    snprintf(g_cfg.rom, sizeof g_cfg.rom, "%s/rom.nes", g_dir);
     g_cfg.port = DEFAULT_PORT;
     g_cfg.res = 720;                      /* v1.3: por defecto 720p (probado en la PS3) */
     g_cfg.audio = 1;                      /* v1.5: sonido activado por defecto (audio=off o R2 al abrir lo apaga) */
@@ -225,10 +232,7 @@ static void cfg_load(void)
         while (*v == ' ' || *v == '\t') v++;
         e = v + strlen(v);
         while (e > v && (e[-1] == '\n' || e[-1] == '\r' || e[-1] == ' ' || e[-1] == '\t')) *--e = 0;
-        if (!strcmp(k, "rom")) {
-            if (v[0] == '/') snprintf(g_cfg.rom, sizeof g_cfg.rom, "%s", v);
-            else snprintf(g_cfg.rom, sizeof g_cfg.rom, "%s/%s", g_dir, v);
-        }
+        if (!strcmp(k, "rom")) { /* v1.7: la ROM ya no se lee de aqui, se elige en el menu (carpeta roms) */ }
         else if (!strcmp(k, "mode"))      snprintf(g_cfg.mode, sizeof g_cfg.mode, "%s", v);
         else if (!strcmp(k, "code"))      snprintf(g_cfg.code, sizeof g_cfg.code, "%s", v);
         else if (!strcmp(k, "public_ip")) snprintf(g_cfg.public_ip, sizeof g_cfg.public_ip, "%s", v);
@@ -345,6 +349,9 @@ static void ui_text(int x, int y, const char *s, int sc, uint32_t col)
     for (; *s; s++, x += 6 * sc) {
         int c = (unsigned char)*s, cx, cy, i, j;
         if (c >= 'a' && c <= 'z') c -= 32;
+        if (c == '_') c = '-';                /* v1.7: la fuente no trae _ ni [ ]: nombres de ROM mas legibles */
+        else if (c == '[') c = '(';
+        else if (c == ']') c = ')';
         if (c < 32 || c > 90) c = '?';
         for (cx = 0; cx < 5; cx++) {
             uint8_t colbits = font5x7[c - 32][cx];
@@ -967,18 +974,37 @@ static uint16_t ui_edges(void)
     return e;
 }
 
+/* v1.7: R2 abre el menu de salir (en NES R2 no se usa). prime=1 solo memoriza el estado actual,
+ * para ignorar un R2 que siga apretado al empezar la partida (se aprieta R2 al abrir para quitar el audio). */
+static int exit_pressed(int prime, uint32_t frame)
+{
+    static int prev;
+    padData *d = pad_read(0);
+    int now = d->BTN_R2 ? 1 : 0;
+    int e = now && !prev;
+    (void)frame;
+    prev = now;
+    return prime ? 0 : e;
+}
+
+/* descarta pulsaciones viejas del menu (memoriza lo que esta apretado ahora) */
+static void ui_prime(void) { (void)ui_edges(); }
+
 #else /* ------------------------- version de pruebas (PC) ------------- */
 
 static void pump(void) {}
-static void present(void) { heartbeat(); }
+static void present(void);                 /* definida mas abajo (puede volcar capturas de pantalla) */
 static void net_ensure(void) {}
 
-/* Pulsaciones simuladas del menu: u d l r = direcciones, x = OK, o = cancelar, s = START */
+/* Pulsaciones simuladas del menu: u d l r = direcciones, x = OK, o = cancelar, s = START.
+ * Al agotarse el guion (si habia uno) la app se cierra, para que las pruebas terminen solas. */
 static const char *g_ui_script = "";
+static int g_ui_has_script;
+static uint32_t g_exit_at = 0xFFFFFFFEu;   /* prueba: frame en el que "se aprieta R2" (NESNET_R2) */
 static uint16_t ui_edges(void)
 {
     char c = *g_ui_script;
-    if (!c) return 0;
+    if (!c) { if (g_ui_has_script) g_running = 0; return 0; }
     g_ui_script++;
     switch (c) {
     case 'u': return UI_UP;
@@ -992,6 +1018,30 @@ static uint16_t ui_edges(void)
     }
 }
 static uint16_t pad_nes_bits(int port) { (void)port; return 0; }
+static void ui_prime(void) {}
+static int exit_pressed(int prime, uint32_t frame) { return !prime && frame == g_exit_at; }
+
+/* Capturas de prueba: NESNET_SHOTDIR=carpeta NESNET_SHOTS=3,40,90 (numeros de present()) */
+static void dump_ppm(const char *path);
+static uint32_t g_present_n;
+static void present(void)
+{
+    const char *dir = getenv("NESNET_SHOTDIR"), *lst = getenv("NESNET_SHOTS");
+    heartbeat();
+    g_present_n++;
+    if (dir && lst) {
+        const char *p = lst;
+        while (*p) {
+            if ((uint32_t)atoi(p) == g_present_n) {
+                char path[400];
+                snprintf(path, sizeof path, "%s/shot_%u.ppm", dir, (unsigned)g_present_n);
+                dump_ppm(path);
+            }
+            while (*p && *p != ',') p++;
+            if (*p == ',') p++;
+        }
+    }
+}
 
 /* Mando simulado: determinista por (jugador, frame); cambia cada 6 frames */
 static uint16_t script_input(int slot, uint32_t f)
@@ -1097,6 +1147,89 @@ static int read_whole_file(const char *path, uint8_t **buf, size_t *size)
     if (!*buf || fread(*buf, 1, (size_t)n, f) != (size_t)n) { fclose(f); free(*buf); *buf = NULL; return 0; }
     fclose(f);
     *size = (size_t)n;
+    return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Selector de ROMs (v1.7): USRDIR/roms/, reconocidas por su cabecera  */
+/* ------------------------------------------------------------------ */
+typedef struct { char name[ROM_NAMELEN]; } RomEnt;
+static RomEnt g_roms[ROM_MAX];
+static int    g_nroms;
+
+static int name_cmp(const char *a, const char *b)
+{
+    for (;; a++, b++) {
+        int x = (unsigned char)*a, y = (unsigned char)*b;
+        if (x >= 'a' && x <= 'z') x -= 32;
+        if (y >= 'a' && y <= 'z') y -= 32;
+        if (x != y) return x < y ? -1 : 1;
+        if (!x) return 0;
+    }
+}
+
+static int rom_cmp(const void *a, const void *b)
+{
+    return name_cmp(((const RomEnt *)a)->name, ((const RomEnt *)b)->name);
+}
+
+/* 1 si el archivo es una ROM de NES: archivo normal, tamano razonable y cabecera iNES ("NES"+1A) o UNIF */
+static int is_nes_file(const char *path)
+{
+    struct stat st;
+    uint8_t h[4];
+    FILE *f;
+    int ok = 0;
+    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return 0;
+    if (st.st_size < 32 || st.st_size > 8 * 1024 * 1024) return 0;
+    f = fopen(path, "rb");
+    if (!f) return 0;
+    if (fread(h, 1, 4, f) == 4) {
+        if (h[0] == 'N' && h[1] == 'E' && h[2] == 'S' && h[3] == 0x1A) ok = 1;
+        else if (h[0] == 'U' && h[1] == 'N' && h[2] == 'I' && h[3] == 'F') ok = 1;
+    }
+    fclose(f);
+    return ok;
+}
+
+static void roms_scan(void)
+{
+    char dir[300], path[420];
+    DIR *d;
+    struct dirent *e;
+    g_nroms = 0;
+    snprintf(dir, sizeof dir, "%s/roms", g_dir);
+    mkdir(dir, 0777);                    /* si no existe, la crea para que se sepa donde van las ROMs */
+    d = opendir(dir);
+    if (!d) { logf_("roms: no pude abrir %s (errno=%d)", dir, errno); return; }
+    while ((e = readdir(d)) != NULL && g_nroms < ROM_MAX) {
+        if (e->d_name[0] == '.') continue;
+        if (strlen(e->d_name) >= ROM_NAMELEN) { logf_("roms: nombre demasiado largo, lo salto"); continue; }
+        snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
+        if (!is_nes_file(path)) continue;
+        snprintf(g_roms[g_nroms].name, ROM_NAMELEN, "%s", e->d_name);
+        g_nroms++;
+    }
+    closedir(d);
+    if (g_nroms > 1) qsort(g_roms, (size_t)g_nroms, sizeof g_roms[0], rom_cmp);
+    logf_("roms: %d ROM(s) en %s", g_nroms, dir);
+}
+
+/* Lee la ROM g_roms[idx] y la deja como la activa (g_rom/g_romcrc). 1 = bien */
+static int rom_load(int idx)
+{
+    char path[420];
+    uint8_t *buf = NULL;
+    size_t sz = 0;
+    snprintf(path, sizeof path, "%s/roms/%s", g_dir, g_roms[idx].name);
+    if (!read_whole_file(path, &buf, &sz)) { logf_("roms: no pude leer %s", path); return 0; }
+    free(g_rom);
+    g_rom = buf;
+    g_romsz = sz;
+    g_romcrc = crc32_buf(g_rom, g_romsz);
+    snprintf(g_cfg.rom, sizeof g_cfg.rom, "%s", path);
+    snprintf(g_rom_name, sizeof g_rom_name, "%s", g_roms[idx].name);
+    logf_("ROM elegida: %s  %u bytes  crc32=%08X", g_rom_name, (unsigned)g_romsz, (unsigned)g_romcrc);
     return 1;
 }
 
@@ -1728,6 +1861,38 @@ static uint16_t local_bits(int port, int slot, uint32_t frame)
 #endif
 }
 
+/* v1.7: mini menu de salida (se abre con R2). Devuelve 1 si confirma salir (X), 0 si sigue jugando (O).
+ * Dibuja encima de la imagen del juego y la restaura al cerrar. */
+static uint32_t g_fb_save[SCR_W * SCR_H];
+
+static int exit_menu(int online)
+{
+    int r = -1, x, y;
+    memcpy(g_fb_save, g_fb, sizeof g_fb);
+    g_stage = "menu-salir";
+    ui_prime();
+    while (g_running && r < 0) {
+        uint16_t e;
+        pump();
+        e = ui_edges();
+        if (e & UI_OK) r = 1;
+        else if (e & UI_CANCEL) r = 0;
+        for (y = 76; y < 164; y++)
+            for (x = 20; x < 236; x++)
+                g_fb[y * SCR_W + x] = (y < 78 || y >= 162 || x < 22 || x >= 234) ? 0xFFFFFFFF : 0xFF101838;
+        ui_center(90, "SALIR DE LA PARTIDA?", 1, 0xFFFFFFFF);
+        ui_center(116, "X: SI      O: NO", 1, 0xFFFFD040);
+        if (online) ui_center(138, "TERMINA LA PARTIDA PARA LOS DOS", 1, 0xFFFFC040);
+        present();
+#ifdef NESNET_HOST
+        sleep_ms(16);
+#endif
+    }
+    memcpy(g_fb, g_fb_save, sizeof g_fb);
+    g_stage = "juego";
+    return r == 1;
+}
+
 /* role: 0 = host (P1), 1 = cliente (P2), -1 = local directo (2 mandos),
  *       -2 = referencia de pruebas: local con el mismo retraso D     */
 static int session_loop(int role, int D, uint32_t maxframes)
@@ -1736,7 +1901,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
     uint8_t  have[RING];
     uint32_t mine_f[RING], mine_c[RING], rem_f[RING], rem_c[RING];
     uint32_t frame = 0, last_rx = now_ms();
-    int i, ended_ok = 1, peer_gone = 0, peer_quit = 0;
+    int i, ended_ok = 1, peer_gone = 0, peer_quit = 0, user_exit = 0;
     char ov[64];
 
     memset(loc, 0, sizeof loc); memset(rem, 0, sizeof rem); memset(have, 0, sizeof have);
@@ -1753,9 +1918,18 @@ static int session_loop(int role, int D, uint32_t maxframes)
             g_desyncs++; \
             mine_f[_f % RING] = NO_FRAME; } } while (0)
 
+    (void)exit_pressed(1, 0);               /* ignora un R2 que siga apretado desde antes */
+
     while (g_running && (maxframes == 0 || frame < maxframes)) {
         uint16_t p1, p2;
         pump();
+
+        /* v1.7: R2 abre el menu de salir. Se mira antes de mandar la entrada de este frame; si sigue, el
+         * otro lado simplemente espera como siempre. No cambia nada del protocolo ni del lockstep. */
+        if (role != -2 && exit_pressed(0, frame)) {
+            if (exit_menu(role >= 0)) { user_exit = 1; logf_("salida pedida por el jugador (R2) en frame %u", (unsigned)frame); goto out; }
+            last_rx = now_ms();
+        }
 
         if (role == -1) {
             p1 = local_bits(0, 0, frame);
@@ -1830,6 +2004,12 @@ static int session_loop(int role, int D, uint32_t maxframes)
 out:
     if (role >= 0 && g_net >= 0) {
         Msg q; memset(&q, 0, sizeof q); q.type = M_QUIT; net_send(&q);
+        if (user_exit) {
+            /* v1.7: vacia lo que el otro lado alcance a mandar (hasta 300 ms o hasta que cierre), para que
+             * al cerrar el socket no se pierda el aviso de salida (cerrar con datos sin leer lo descarta) */
+            uint32_t t0 = now_ms();
+            while (now_ms() - t0 < 300) { if (net_recv(&q, 20) < 0) break; }
+        }
     }
 #undef COMPARE
     return ended_ok;
@@ -1841,7 +2021,7 @@ out:
 static void ui_show(const char *l1, const char *l2, const char *l3)
 {
     ui_clear();
-    ui_center(20, "NESNET V1.6", 2, 0xFFFFD040);
+    ui_center(20, "NESNET V1.7", 2, 0xFFFFD040);
     if (l1) ui_center(90, l1, 1, 0xFFFFFFFF);
     if (l2) ui_center(110, l2, 1, 0xFFC0C0FF);
     if (l3) ui_center(130, l3, 1, 0xFFC0C0FF);
@@ -1863,28 +2043,111 @@ static void ui_message(const char *l1, const char *l2, int frames)
     }
 }
 
-static int ui_menu(void)
+/* Copia 'src' en 'dst' (cap bytes) acortando con "..." si no cabe en 'maxc' caracteres */
+static void fit_name(char *dst, size_t cap, const char *src, int maxc)
 {
-    static const char *items[3] = { "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS" };
-    static const int modes[3] = { MODE_HOST, MODE_JOIN, MODE_SOLO };   /* mismo orden que items */
-    int sel = 0, i;
-    g_stage = "menu";
+    size_t n = strlen(src);
+    if ((int)n <= maxc && n < cap) { snprintf(dst, cap, "%s", src); return; }
+    if ((size_t)maxc >= cap) maxc = (int)cap - 1;
+    memcpy(dst, src, (size_t)maxc);
+    dst[maxc] = 0;
+    if (maxc >= 3) { dst[maxc - 3] = '.'; dst[maxc - 2] = '.'; dst[maxc - 1] = '.'; }
+}
+
+/* Selector de ROM: lista de USRDIR/roms. 1 = eligio y cargo una ROM, 0 = volvio sin elegir */
+static int ui_rom_select(void)
+{
+    enum { VIS = 11 };
+    int sel = 0, top = 0, i;
+    g_stage = "elegir-rom";
+    roms_scan();
+    for (i = 0; i < g_nroms; i++) if (g_rom_name[0] && !strcmp(g_roms[i].name, g_rom_name)) sel = i;
     while (g_running) {
         uint16_t e;
+        char line[64], nm[48];
         pump();
         e = ui_edges();
-        if (e & UI_UP)   sel = (sel + 2) % 3;
-        if (e & UI_DOWN) sel = (sel + 1) % 3;
-        if (e & (UI_OK | UI_START)) return modes[sel];
+        if (e & UI_CANCEL) return 0;
+        if (g_nroms > 0) {
+            if (e & UI_UP)    sel = (sel + g_nroms - 1) % g_nroms;
+            if (e & UI_DOWN)  sel = (sel + 1) % g_nroms;
+            if (e & UI_LEFT)  sel = sel - 10 < 0 ? 0 : sel - 10;
+            if (e & UI_RIGHT) sel = sel + 10 >= g_nroms ? g_nroms - 1 : sel + 10;
+            if (e & (UI_OK | UI_START)) {
+                ui_show("CARGANDO ROM...", g_roms[sel].name, NULL);
+                if (rom_load(sel)) return 1;
+                ui_message("NO PUDE LEER LA ROM", g_roms[sel].name, 300);
+            }
+            if (sel < top) top = sel;
+            if (sel >= top + VIS) top = sel - VIS + 1;
+        }
         ui_clear();
-        ui_center(20, "NESNET V1.6", 2, 0xFFFFD040);
+        ui_center(14, "ELEGIR ROM", 2, 0xFFFFD040);
+        if (g_nroms == 0) {
+            ui_center(80, "NO HAY ROMS EN LA CARPETA:", 1, 0xFFFFFFFF);
+            ui_center(100, "NESN00001/USRDIR/ROMS", 1, 0xFFC0C0FF);
+            ui_center(124, "PON AHI TUS ROMS DE NES", 1, 0xFFC0C0FF);
+            ui_center(140, "Y VUELVE A ENTRAR AQUI", 1, 0xFFC0C0FF);
+        } else {
+            snprintf(line, sizeof line, "%d / %d", sel + 1, g_nroms);
+            ui_center(38, line, 1, 0xFFC0C0FF);
+            for (i = 0; i < VIS && top + i < g_nroms; i++) {
+                int k = top + i;
+                fit_name(nm, sizeof nm, g_roms[k].name, 38);
+                snprintf(line, sizeof line, "%s %s", k == sel ? ">" : " ", nm);
+                ui_text(8, 54 + i * 13, line, 1, k == sel ? 0xFFFFFFFF : 0xFF8080A0);
+            }
+            if (top > 0)              ui_text(244, 54, "^", 1, 0xFFC0C0FF);
+            if (top + VIS < g_nroms)  ui_text(244, 54 + (VIS - 1) * 13, "V", 1, 0xFFC0C0FF);
+        }
+        if (g_nroms) ui_center(198, "IZQ/DER: SALTAR 10", 1, 0xFF8080A0);
+        ui_center(212, g_nroms ? "X: ELEGIR   O: VOLVER" : "O: VOLVER", 1, 0xFF8080A0);
+        present();
+#ifdef NESNET_HOST
+        sleep_ms(16);
+#endif
+    }
+    return 0;
+}
+
+static int ui_menu(void)
+{
+    static const char *items[4] = { "ELEGIR ROM", "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS" };
+    static const int modes[4] = { MODE_ROM, MODE_HOST, MODE_JOIN, MODE_SOLO };   /* mismo orden que items */
+    int i;
+    g_stage = "menu";
+    ui_prime();
+    while (g_running) {
+        uint16_t e;
+        char l[80], nm[48];
+        pump();
+        e = ui_edges();
+        if (e & UI_UP)   g_menu_sel = (g_menu_sel + 3) % 4;
+        if (e & UI_DOWN) g_menu_sel = (g_menu_sel + 1) % 4;
+        if (e & (UI_OK | UI_START)) {
+            /* sin ROM elegida el juego queda en stand-by: solo se puede entrar a ELEGIR ROM */
+            if (modes[g_menu_sel] != MODE_ROM && !g_rom) ui_message("PRIMERO ELIGE UNA ROM", "OPCION: ELEGIR ROM", 120);
+            else return modes[g_menu_sel];
+        }
+        ui_clear();
+        ui_center(20, "NESNET V1.7", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
-        for (i = 0; i < 3; i++) {
+        if (g_rom) {
+            fit_name(nm, sizeof nm, g_rom_name, 34);
+            snprintf(l, sizeof l, "ROM: %s", nm);
+            ui_center(66, l, 1, 0xFF80FF80);
+        } else {
+            ui_center(66, "ROM: NINGUNA (ELIGE UNA)", 1, 0xFFFFC040);
+        }
+        for (i = 0; i < 4; i++) {
             char line[40];
-            snprintf(line, sizeof line, "%s %s", i == sel ? ">" : " ", items[i]);
-            ui_center(90 + i * 22, line, 1, i == sel ? 0xFFFFFFFF : 0xFF8080A0);
+            uint32_t col = i == g_menu_sel ? 0xFFFFFFFF : 0xFF8080A0;
+            if (!g_rom && modes[i] != MODE_ROM) col = i == g_menu_sel ? 0xFFA0A0B0 : 0xFF505068;   /* bloqueadas sin ROM */
+            snprintf(line, sizeof line, "%s %s", i == g_menu_sel ? ">" : " ", items[i]);
+            ui_center(96 + i * 22, line, 1, col);
         }
         ui_center(200, "ARRIBA/ABAJO + X", 1, 0xFF8080A0);
+        ui_center(214, "EN PARTIDA: R2 = SALIR", 1, 0xFF8080A0);
         present();
 #ifdef NESNET_HOST
         sleep_ms(16);
@@ -1915,7 +2178,7 @@ static int ui_enter_code(char *out)
         for (i = 0; i < 15; i++) digits[i] = (char)('0' + d[i]);
         digits[15] = 0;
         ui_clear();
-        ui_center(20, "NESNET V1.6", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.7", 2, 0xFFFFD040);
         ui_center(60, "ESCRIBE EL CODIGO DEL HOST", 1, 0xFFFFFFFF);
         for (i = 0; i < 15; i++) {
             char c[2] = { digits[i], 0 };
@@ -2009,7 +2272,7 @@ static int run_host_inner(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.6", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.7", 2, 0xFFFFD040);
         ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
         ui_center(84, code, 2, 0xFFFFFF40);
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -2111,7 +2374,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("NesNet v1.6 - dir=%s", g_dir);
+    logf_("NesNet v1.7 - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
 }
@@ -2122,28 +2385,23 @@ static int app_main(const char *argv0)
 
     app_prepare(argv0);
 
-    if (!read_whole_file(g_cfg.rom, &g_rom, &g_romsz)) {
-        char l2[80];
-        logf_("no se pudo leer la ROM: %s", g_cfg.rom);
-        snprintf(l2, sizeof l2, "PON LA ROM EN: %s", g_dir);
-        ui_message("NO ENCUENTRO LA ROM (rom.nes)", l2, 600);
-        return 1;
-    }
-    g_romcrc = crc32_buf(g_rom, g_romsz);
-    logf_("ROM %s  %u bytes  crc32=%08X", g_cfg.rom, (unsigned)g_romsz, (unsigned)g_romcrc);
+    /* v1.7: arranca en stand-by, sin ROM. La ROM se elige en el menu (ELEGIR ROM) antes de crear/unirse/jugar */
+    logf_("stand-by: sin ROM elegida (roms en %s/roms)", g_dir);
 
     core_boot();
 
     from_cfg = g_cfg.mode[0] != 0;
+    if (from_cfg) { logf_("config.txt trae mode=%s: se ignora, primero hay que elegir ROM en el menu", g_cfg.mode); from_cfg = 0; }
     while (g_running) {
         int ok = 1;
-        if (from_cfg) {
-            choice = !strcmp(g_cfg.mode, "host") ? MODE_HOST : !strcmp(g_cfg.mode, "client") ? MODE_JOIN :
-                     !strcmp(g_cfg.mode, "local") ? MODE_SOLO : -1;
-            from_cfg = 0;                 /* despues de la primera vez, usa el menu */
-        }
         if (choice < 0) choice = ui_menu();
         if (choice < 0) break;
+        if (choice == MODE_ROM) {
+            if (ui_rom_select()) g_menu_sel = 1;          /* tras elegir, el cursor pasa a CREAR SALA */
+            choice = -1;
+            continue;
+        }
+        if (!g_rom) { choice = -1; continue; }             /* seguridad: sin ROM no se arranca nada */
         logf_("modo elegido: %s", choice == MODE_SOLO ? "SOLO (2 mandos)" : choice == MODE_HOST ? "CREAR SALA (host)" : "UNIRSE (cliente)");
         g_err = "";
         if (choice == MODE_SOLO) ok = run_solo();
@@ -2151,7 +2409,7 @@ static int app_main(const char *argv0)
         else ok = run_client();
         choice = -1;
 #ifdef NESNET_HOST
-        if (g_maxframes) g_running = 0;       /* pruebas: una sola sesion */
+        if (g_maxframes && !g_ui_has_script) g_running = 0;   /* pruebas: una sola sesion (con guion, sigue hasta que se agote) */
 #endif
         if (!ok || g_err[0]) {
             logf_("fin con error: %s", g_err);
@@ -2220,7 +2478,7 @@ int main(int argc, char **argv)
         static const char *items[3] = { "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS" };
         int i;
         ui_clear();
-        ui_center(20, "NESNET V1.6", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.7", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         for (i = 0; i < 3; i++) {
             char line[40];
@@ -2232,7 +2490,7 @@ int main(int argc, char **argv)
             char code[20];
             code_encode(((uint32_t)181 << 24) | (45u << 16) | (200u << 8) | 17u, 7777, code);
             ui_clear();
-            ui_center(20, "NESNET V1.6", 2, 0xFFFFD040);
+            ui_center(20, "NESNET V1.7", 2, 0xFFFFD040);
             ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
             ui_center(84, code, 2, 0xFFFFFF40);
             ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -2249,13 +2507,16 @@ int main(int argc, char **argv)
     frames = (uint32_t)atoi(argv[3]);
     if (argc > 4) port = atoi(argv[4]);
     g_maxframes = frames;
+    if (getenv("NESNET_UI")) { g_ui_script = getenv("NESNET_UI"); g_ui_has_script = 1; }   /* pruebas del menu de salir */
+    if (getenv("NESNET_R2")) g_exit_at = (uint32_t)atoi(getenv("NESNET_R2"));
     signal(SIGPIPE, SIG_IGN);
     if (!strcmp(mode, "app")) {
         /* flujo real: lee DIR/config.txt y ejecuta app_main (argv[4] = carpeta) */
         char exe[300];
         int rc;
         snprintf(exe, sizeof exe, "%s/EBOOT.BIN", argv[4]);
-        if (getenv("NESNET_UI")) g_ui_script = getenv("NESNET_UI");
+        if (getenv("NESNET_UI")) { g_ui_script = getenv("NESNET_UI"); g_ui_has_script = 1; }
+        if (getenv("NESNET_R2")) g_exit_at = (uint32_t)atoi(getenv("NESNET_R2"));
         rc = app_main(exe);
         printf("RESULT mode=app frames=%u hash=%08X desyncs=%d rc=%d\n", (unsigned)g_frames_done,
                (unsigned)g_run_hash, g_desyncs, rc);
