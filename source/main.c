@@ -36,6 +36,8 @@
 #include <arpa/inet.h>
 #include <net/net.h>
 #include <net/netdb.h>
+#include <net/netctl.h>
+#include <sysmodule/sysmodule.h>
 #include <netinet/in.h>
 SYS_PROCESS_PARAM(1001, 0x100000);
 int closesocket(int s);      /* definida en libnet, pero sin prototipo en las cabeceras */
@@ -105,6 +107,7 @@ typedef struct {
     int      render;          /* 0 = GPU (escalado), 1 = CPU directo (sin transferencia GPU) */
     int      zoom;            /* 0 = automatico */
     int      audio;           /* 1 = con sonido (por defecto), 0 = sin sonido */
+    int      upnp;            /* v1.6: 1 = el host abre el puerto por UPnP (por defecto), 0 = no */
 } Config;
 
 static Config   g_cfg;
@@ -199,6 +202,7 @@ static void cfg_defaults(void)
     g_cfg.res = 720;                      /* v1.3: por defecto 720p (probado en la PS3) */
     g_cfg.audio = 1;                      /* v1.5: sonido activado por defecto (audio=off o R2 al abrir lo apaga) */
     g_cfg.render = 1;                     /* v1.3: por defecto dibujo por CPU, sin la GPU (la ruta GPU se colgo 3 veces) */
+    g_cfg.upnp = 1;                       /* v1.6: abrir el puerto por UPnP (upnp=off en config.txt lo apaga) */
 }
 
 static void cfg_load(void)
@@ -234,6 +238,7 @@ static void cfg_load(void)
         else if (!strcmp(k, "render"))    { if (!strcmp(v, "gpu")) g_cfg.render = 0; else if (!strcmp(v, "cpu")) g_cfg.render = 1; }
         else if (!strcmp(k, "zoom"))      g_cfg.zoom = atoi(v);
         else if (!strcmp(k, "audio"))     { if (!strcmp(v, "off")) g_cfg.audio = 0; else if (!strcmp(v, "on")) g_cfg.audio = 1; }
+        else if (!strcmp(k, "upnp"))      { if (!strcmp(v, "off")) g_cfg.upnp = 0; else if (!strcmp(v, "on")) g_cfg.upnp = 1; }
     }
     fclose(f);
     if (g_cfg.port <= 0 || g_cfg.port > 65535) g_cfg.port = DEFAULT_PORT;
@@ -1233,39 +1238,60 @@ static void sock_nodelay(int fd)
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);   /* si falla, no pasa nada */
 }
 
+/* v1.6: diagnostico de connect. kind: 0 ok, 1 sin respuesta (timeout), 2 rechazado o error de red, 3 sin socket */
+static int      g_conn_kind;
+static int      g_conn_err;
+static uint32_t g_conn_ms;
+
 static int tcp_connect(uint32_t ip, int port, int timeout_ms)
 {
     struct sockaddr_in a;
+    uint32_t t0 = now_ms();
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+    g_conn_kind = 0; g_conn_err = 0; g_conn_ms = 0;
+    if (fd < 0) { g_conn_kind = 3; g_conn_err = errno; goto fail; }
     sock_nonblock(fd, 1);
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
     a.sin_port = htons((uint16_t)port);
     a.sin_addr.s_addr = htonl(ip);
     if (connect(fd, (struct sockaddr *)&a, sizeof a) < 0) {
-        int err = 0;
+        int err = 0, r;
         socklen_t l = sizeof err;
-        if (fd_wait(fd, POLLOUT, timeout_ms) <= 0) { closesocket(fd); return -1; }
-        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &l) == 0 && err != 0) { closesocket(fd); return -1; }
+        r = fd_wait(fd, POLLOUT, timeout_ms);
+        if (r <= 0) { g_conn_kind = (r == 0) ? 1 : 2; closesocket(fd); goto fail; }
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &l) == 0 && err != 0) {
+            g_conn_kind = 2; g_conn_err = err; closesocket(fd); goto fail;
+        }
     }
     sock_nonblock(fd, 0);
     sock_nodelay(fd);
+    g_conn_ms = now_ms() - t0;
     return fd;
+fail:
+    g_conn_ms = now_ms() - t0;
+    logf_("connect %u.%u.%u.%u:%d FALLO: %s (error=%d) tras %u ms",
+          (unsigned)(ip >> 24), (unsigned)((ip >> 16) & 255), (unsigned)((ip >> 8) & 255), (unsigned)(ip & 255), port,
+          g_conn_kind == 1 ? "SIN RESPUESTA (timeout)" : g_conn_kind == 3 ? "NO SE PUDO CREAR EL SOCKET" : "RECHAZADO O ERROR DE RED",
+          g_conn_err, (unsigned)g_conn_ms);
+    return -1;
 }
 
 static int tcp_listen(int port)
 {
     struct sockaddr_in a;
-    int one = 1;
+    int one = 1, rb, rl;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return -1;
+    if (fd < 0) { logf_("escucha: socket() fallo (errno=%d)", errno); return -1; }
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     memset(&a, 0, sizeof a);
     a.sin_family = AF_INET;
     a.sin_port = htons((uint16_t)port);
     a.sin_addr.s_addr = htonl(INADDR_ANY);
-    if (bind(fd, (struct sockaddr *)&a, sizeof a) < 0 || listen(fd, 1) < 0) { closesocket(fd); return -1; }
+    rb = bind(fd, (struct sockaddr *)&a, sizeof a);
+    rl = rb < 0 ? -1 : listen(fd, 1);
+    logf_("escucha: puerto TCP %d  bind=%d listen=%d", port, rb, rl);
+    if (rb < 0 || rl < 0) { closesocket(fd); return -1; }
     return fd;
 }
 
@@ -1310,6 +1336,271 @@ static int get_public_ip(uint32_t *ip)
     body += 4;
     while (*body == ' ' || *body == '\r' || *body == '\n') body++;
     return parse_ip(body, ip);
+}
+
+/* ------------------------------------------------------------------ */
+/* UPnP (v1.6): el host abre su puerto TCP en el router y lee la IP del */
+/* router. Los pasos (SSDP -> descripcion del router -> llamadas SOAP)  */
+/* siguen el netplay de Melee-PS3 (ps3/net/upnp.c, GPLv2 o posterior),  */
+/* que ya conecto entre estas dos casas; aqui es una version propia     */
+/* sobre los sockets de NesNet.                                         */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    int      router;      /* un router contesto por UPnP */
+    int      opened;      /* el puerto lleva a esta consola */
+    int      http;        /* estado HTTP del AddPortMapping (0 = no hubo) */
+    int      error;       /* codigo de error UPnP (0 = ninguno) */
+    uint32_t public_ip;   /* IP WAN que dice el router (0 = no la dio) */
+    uint32_t local_ip;    /* IP de esta consola en la LAN (0 = no se pudo leer) */
+} Upnp;
+
+#define UPNP_BUF 12288
+static char     g_ubuf[UPNP_BUF];
+static uint32_t g_ctl_ip;
+static int      g_ctl_port;
+static char     g_ctl_path[160], g_ctl_svc[96];
+static int      g_upnp_added, g_upnp_port;
+
+#define IP4(ip) (unsigned)((ip) >> 24), (unsigned)(((ip) >> 16) & 255), (unsigned)(((ip) >> 8) & 255), (unsigned)((ip) & 255)
+
+static int ip_privada(uint32_t ip)
+{
+    return (ip >> 24) == 10 || (ip >> 20) == 0xAC1 || (ip >> 16) == 0xC0A8 || (ip >> 22) == ((100u << 2) | 1) ||
+           (ip >> 24) == 127 || (ip >> 16) == 0xA9FE || ip == 0;
+}
+
+static void sa_fill(struct sockaddr_in *s, uint32_t ip, int port)
+{
+    memset(s, 0, sizeof *s);
+#ifdef NESNET_PS3
+    s->sin_len = sizeof *s;               /* PSL1GHT es BSD: con sin_len=0, sendto falla con ENOENT */
+#endif
+    s->sin_family = AF_INET;
+    s->sin_port = htons((uint16_t)port);
+    s->sin_addr.s_addr = htonl(ip);
+}
+
+/* IP de esta consola en su red local */
+static uint32_t local_ip_get(void)
+{
+#ifdef NESNET_PS3
+    static int loaded;
+    union net_ctl_info info;
+    if (!loaded) { loaded = 1; sysModuleLoad(SYSMODULE_NETCTL); netCtlInit(); }
+    if (netCtlGetInfo(NET_CTL_INFO_IP_ADDRESS, &info) < 0) return 0;
+    if (inet_addr(info.ip_address) == INADDR_NONE) return 0;
+    return ntohl(inet_addr(info.ip_address));
+#else
+    const char *e = getenv("NESNET_LOCAL_IP");
+    uint32_t ip;
+    return (e && parse_ip(e, &ip)) ? ip : 0x7F000001u;
+#endif
+}
+
+/* Un datagrama UDP y la primera respuesta (en resp). Devuelve los bytes o -1. Sigue atendiendo al sistema (pump). */
+static int upnp_udp_ask(uint32_t ip, int port, const char *req, int len, char *resp, int cap, int ms)
+{
+    struct sockaddr_in s;
+    struct timeval tv;
+    uint32_t t0;
+    int fd, n = -1;
+    fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) return -1;
+    tv.tv_sec = 0; tv.tv_usec = 100000;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    sa_fill(&s, ip, port);
+    if (sendto(fd, req, (size_t)len, 0, (struct sockaddr *)&s, sizeof s) == len) {
+        t0 = now_ms();
+        for (;;) {
+            socklen_t sl = sizeof s;
+            int r = (int)recvfrom(fd, resp, (size_t)cap, 0, (struct sockaddr *)&s, &sl);
+            if (r > 0) { n = r; break; }
+            if ((int)(now_ms() - t0) >= ms) break;
+            pump();
+            if (!g_running) break;
+            sleep_ms(2);
+        }
+    }
+    closesocket(fd);
+    return n;
+}
+
+/* Pide por HTTP/TCP y deja la respuesta (terminada en 0) en g_ubuf. Devuelve los bytes o -1. */
+static int upnp_http(uint32_t ip, int port, const char *req, int ms)
+{
+    int fd, len = 0, n;
+    fd = tcp_connect(ip, port, ms);
+    if (fd < 0) return -1;
+    if (send(fd, req, (int)strlen(req), 0) <= 0) { closesocket(fd); return -1; }
+    while (len < UPNP_BUF - 1 && fd_wait(fd, POLLIN, ms) > 0) {
+        n = (int)recv(fd, g_ubuf + len, UPNP_BUF - 1 - len, 0);
+        if (n <= 0) break;
+        len += n;
+    }
+    closesocket(fd);
+    g_ubuf[len] = 0;
+    return len > 0 ? len : -1;
+}
+
+/* Texto entre <name> y </name> a partir de p; devuelve donde acaba o NULL */
+static const char *x_tag(const char *p, const char *name, char *out, size_t cap)
+{
+    char open[64], close_[64];
+    const char *s, *e;
+    size_t n;
+    snprintf(open, sizeof open, "<%s>", name);
+    snprintf(close_, sizeof close_, "</%s>", name);
+    s = strstr(p, open);
+    if (!s) return NULL;
+    e = strstr(s, close_);
+    if (!e) return NULL;
+    s += strlen(open);
+    n = (size_t)(e - s) < cap - 1 ? (size_t)(e - s) : cap - 1;
+    memcpy(out, s, n);
+    out[n] = 0;
+    return e;
+}
+
+/* "http://a.b.c.d[:puerto]/ruta" */
+static int x_url(const char *url, uint32_t *ip, int *port, char *path, size_t cap)
+{
+    unsigned a, b, c, d, pt = 80;
+    const char *slash;
+    if (strncmp(url, "http://", 7) != 0 || sscanf(url + 7, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) return 0;
+    if (a > 255 || b > 255 || c > 255 || d > 255) return 0;
+    slash = strchr(url + 7, '/');
+    sscanf(url + 7, "%*[0-9.]:%u", &pt);
+    *ip = (a << 24) | (b << 16) | (c << 8) | d;
+    *port = (int)pt;
+    snprintf(path, cap, "%s", slash ? slash : "/");
+    return 1;
+}
+
+static int ci_prefix(const char *s, const char *pre)
+{
+    for (; *pre; s++, pre++) {
+        char x = *s, y = *pre;
+        if (x >= 'A' && x <= 'Z') x = (char)(x + 32);
+        if (y >= 'A' && y <= 'Z') y = (char)(y + 32);
+        if (x != y) return 0;
+    }
+    return 1;
+}
+
+/* Busca el router (SSDP), lee su descripcion y guarda la URL de control. 1 = encontrado */
+static int upnp_discover(void)
+{
+    static const char search[] =
+        "M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\n"
+        "ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n";
+    char url[192], path[160], req[360], type[96], ctl[160];
+    uint32_t dip = 0;
+    int dport = 0, n;
+    const char *p;
+    url[0] = 0;
+#ifdef NESNET_HOST
+    if (getenv("NESNET_UPNP_URL")) snprintf(url, sizeof url, "%s", getenv("NESNET_UPNP_URL"));
+#endif
+    if (!url[0]) {
+        n = upnp_udp_ask(0xEFFFFFFAu, 1900, search, (int)sizeof search - 1, g_ubuf, UPNP_BUF - 1, 2000);
+        if (n <= 0) { logf_("upnp: SSDP sin respuesta en 2 s (el router no tiene UPnP o lo bloquea)"); return 0; }
+        g_ubuf[n] = 0;
+        p = g_ubuf;
+        while (p && !ci_prefix(p, "location:")) { p = strchr(p, '\n'); p = p ? p + 1 : NULL; }
+        if (!p || sscanf(p + 9, " %191s", url) != 1) { logf_("upnp: la respuesta SSDP no trae LOCATION"); return 0; }
+    }
+    if (!x_url(url, &dip, &dport, path, sizeof path)) { logf_("upnp: URL de descripcion no valida: %s", url); return 0; }
+    snprintf(req, sizeof req, "GET %s HTTP/1.0\r\nHost: %u.%u.%u.%u:%d\r\nConnection: close\r\n\r\n", path, IP4(dip), dport);
+    if (upnp_http(dip, dport, req, 3000) <= 0) { logf_("upnp: no pude leer la descripcion del router (%s)", url); return 0; }
+    for (p = g_ubuf; (p = x_tag(p, "serviceType", type, sizeof type)) != NULL;) {
+        if ((strstr(type, "WANIPConnection") || strstr(type, "WANPPPConnection")) && x_tag(p, "controlURL", ctl, sizeof ctl)) {
+            snprintf(g_ctl_svc, sizeof g_ctl_svc, "%s", type);
+            g_ctl_ip = dip; g_ctl_port = dport;
+            if (ctl[0] == '/') { snprintf(g_ctl_path, sizeof g_ctl_path, "%s", ctl); return 1; }
+            if (!strncmp(ctl, "http://", 7)) return x_url(ctl, &g_ctl_ip, &g_ctl_port, g_ctl_path, sizeof g_ctl_path);
+            snprintf(g_ctl_path, sizeof g_ctl_path, "/%s", ctl);
+            return 1;
+        }
+    }
+    logf_("upnp: el router no ofrece WANIPConnection/WANPPPConnection");
+    return 0;
+}
+
+/* Una llamada SOAP al router: estado HTTP (o -1); respuesta en g_ubuf; error UPnP en *err */
+static int upnp_soap(const char *action, const char *args, int *err)
+{
+    static char body[1024], req[1792];
+    char code[16], status[8];
+    snprintf(body, sizeof body,
+             "<?xml version=\"1.0\"?>\r\n<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
+             "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:%s xmlns:u=\"%s\">%s</u:%s>"
+             "</s:Body></s:Envelope>\r\n", action, g_ctl_svc, args, action);
+    snprintf(req, sizeof req,
+             "POST %s HTTP/1.0\r\nHost: %u.%u.%u.%u:%d\r\nContent-Type: text/xml; charset=\"utf-8\"\r\n"
+             "Content-Length: %d\r\nSOAPAction: \"%s#%s\"\r\nConnection: close\r\n\r\n%s",
+             g_ctl_path, IP4(g_ctl_ip), g_ctl_port, (int)strlen(body), g_ctl_svc, action, body);
+    *err = 0;
+    if (upnp_http(g_ctl_ip, g_ctl_port, req, 3000) <= 0 || sscanf(g_ubuf, "HTTP/%*s %7s", status) != 1) return -1;
+    if (x_tag(g_ubuf, "errorCode", code, sizeof code)) *err = atoi(code);
+    return atoi(status);
+}
+
+/* Abre el puerto TCP en el router hacia esta consola y lee la IP del router */
+static void upnp_open(int port, Upnp *u)
+{
+    char args[640], ip[20], value[40];
+    unsigned a, b, c, d;
+    int status, err = 0, lease = 7200;
+
+    memset(u, 0, sizeof *u);
+    u->local_ip = local_ip_get();
+    logf_("upnp: IP local de la consola = %u.%u.%u.%u", IP4(u->local_ip));
+    if (!upnp_discover()) return;
+    u->router = 1;
+    logf_("upnp: router en %u.%u.%u.%u:%d servicio=%s", IP4(g_ctl_ip), g_ctl_port, g_ctl_svc);
+    if (upnp_soap("GetExternalIPAddress", "", &err) == 200 && x_tag(g_ubuf, "NewExternalIPAddress", value, sizeof value) &&
+        sscanf(value, "%u.%u.%u.%u", &a, &b, &c, &d) == 4 && a < 256 && b < 256 && c < 256 && d < 256) {
+        u->public_ip = (a << 24) | (b << 16) | (c << 8) | d;
+        logf_("upnp: IP WAN del router = %u.%u.%u.%u%s", IP4(u->public_ip), ip_privada(u->public_ip) ? "  (PRIVADA: CGNAT o doble NAT)" : "");
+    } else {
+        logf_("upnp: el router no dio su IP WAN (error=%d)", err);
+    }
+    if (!u->local_ip) { logf_("upnp: no conozco la IP local, no abro el puerto"); return; }
+    snprintf(ip, sizeof ip, "%u.%u.%u.%u", IP4(u->local_ip));
+    for (;;) {
+        snprintf(args, sizeof args,
+                 "<NewRemoteHost></NewRemoteHost><NewExternalPort>%d</NewExternalPort><NewProtocol>TCP</NewProtocol>"
+                 "<NewInternalPort>%d</NewInternalPort><NewInternalClient>%s</NewInternalClient><NewEnabled>1</NewEnabled>"
+                 "<NewPortMappingDescription>NesNet</NewPortMappingDescription><NewLeaseDuration>%d</NewLeaseDuration>",
+                 port, port, ip, lease);
+        status = upnp_soap("AddPortMapping", args, &err);
+        if (err == 725 && lease != 0) { lease = 0; continue; }      /* el router solo acepta reglas permanentes */
+        break;
+    }
+    u->http = status; u->error = err;
+    if (status == 200) {
+        u->opened = 1; g_upnp_added = 1; g_upnp_port = port;
+    } else if (err == 718) {
+        /* ya existia una regla: sirve si lleva a esta consola */
+        snprintf(args, sizeof args,
+                 "<NewRemoteHost></NewRemoteHost><NewExternalPort>%d</NewExternalPort><NewProtocol>TCP</NewProtocol>", port);
+        u->opened = upnp_soap("GetSpecificPortMappingEntry", args, &err) == 200 &&
+                    x_tag(g_ubuf, "NewInternalClient", value, sizeof value) && !strcmp(value, ip);
+    }
+    logf_("upnp: AddPortMapping TCP %d -> %s: http=%d error=%d abierto=%d", port, ip, status, u->error, u->opened);
+}
+
+/* Quita la regla que puso upnp_open (si puso alguna) */
+static void upnp_close(void)
+{
+    char args[256];
+    int err = 0;
+    if (!g_upnp_added) return;
+    g_upnp_added = 0;
+    snprintf(args, sizeof args,
+             "<NewRemoteHost></NewRemoteHost><NewExternalPort>%d</NewExternalPort><NewProtocol>TCP</NewProtocol>", g_upnp_port);
+    upnp_soap("DeletePortMapping", args, &err);
+    logf_("upnp: regla del puerto %d quitada del router (error=%d)", g_upnp_port, err);
 }
 
 /* Codigo = (IP << 16 | puerto) en decimal de 15 digitos */
@@ -1550,7 +1841,7 @@ out:
 static void ui_show(const char *l1, const char *l2, const char *l3)
 {
     ui_clear();
-    ui_center(20, "NESNET V1.5", 2, 0xFFFFD040);
+    ui_center(20, "NESNET V1.6", 2, 0xFFFFD040);
     if (l1) ui_center(90, l1, 1, 0xFFFFFFFF);
     if (l2) ui_center(110, l2, 1, 0xFFC0C0FF);
     if (l3) ui_center(130, l3, 1, 0xFFC0C0FF);
@@ -1586,7 +1877,7 @@ static int ui_menu(void)
         if (e & UI_DOWN) sel = (sel + 1) % 3;
         if (e & (UI_OK | UI_START)) return modes[sel];
         ui_clear();
-        ui_center(20, "NESNET V1.5", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.6", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         for (i = 0; i < 3; i++) {
             char line[40];
@@ -1624,7 +1915,7 @@ static int ui_enter_code(char *out)
         for (i = 0; i < 15; i++) digits[i] = (char)('0' + d[i]);
         digits[15] = 0;
         ui_clear();
-        ui_center(20, "NESNET V1.5", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.6", 2, 0xFFFFD040);
         ui_center(60, "ESCRIBE EL CODIGO DEL HOST", 1, 0xFFFFFFFF);
         for (i = 0; i < 15; i++) {
             char c[2] = { digits[i], 0 };
@@ -1662,26 +1953,54 @@ static int run_online(int is_host, int D)
     return ok;
 }
 
-static int run_host(void)
+static int run_host_inner(void)
 {
     uint32_t ip = 0;
-    char code[20], l2[48];
-    int lfd, D = 0;
+    char code[20], l2[48], l3[48];
+    int lfd, D = 0, got_ip = 0, mism = 0;
+    uint32_t col3;
+    Upnp up;
 
     net_ensure();
+    memset(&up, 0, sizeof up);
+    if (g_cfg.upnp) {
+        g_stage = "upnp";
+        ui_show("CREANDO SALA...", "ABRIENDO EL PUERTO (UPNP)", NULL);
+        upnp_open(g_cfg.port, &up);
+        if (!g_running) return 1;
+    } else {
+        logf_("upnp: apagado (upnp=off en config.txt)");
+    }
     g_stage = "buscando-ip";
     ui_show("CREANDO SALA...", "BUSCANDO TU IP PUBLICA", NULL);
-    if (g_cfg.public_ip[0] && parse_ip(g_cfg.public_ip, &ip)) { /* IP fijada a mano */ }
-    else if (!get_public_ip(&ip)) { g_err = "NO PUDE OBTENER TU IP PUBLICA"; return 0; }
+    if (g_cfg.public_ip[0] && parse_ip(g_cfg.public_ip, &ip)) { got_ip = 1; logf_("IP publica fijada a mano (public_ip=)"); }
+    else if (get_public_ip(&ip)) got_ip = 1;
+    else logf_("ipify: no pude obtener la IP publica");
+    if (!got_ip && up.public_ip && !ip_privada(up.public_ip)) {
+        ip = up.public_ip; got_ip = 1;
+        logf_("uso la IP WAN que dio el router por UPnP");
+    }
+    if (!got_ip) { g_err = "NO PUDE OBTENER TU IP PUBLICA"; return 0; }
+    if (up.public_ip && up.public_ip != ip) {
+        mism = 1;
+        logf_("AVISO: la IP del router (%u.%u.%u.%u) es distinta de la que ve internet (%u.%u.%u.%u): "
+              "probable CGNAT o doble NAT, desde afuera no se llega al puerto", IP4(up.public_ip), IP4(ip));
+    }
     code_encode(ip, g_cfg.port, code);
-    logf_("sala creada: ip=%u.%u.%u.%u puerto=%d codigo=%s",
-          (unsigned)(ip >> 24), (unsigned)((ip >> 16) & 255), (unsigned)((ip >> 8) & 255), (unsigned)(ip & 255),
-          g_cfg.port, code);
+    logf_("sala creada: ip=%u.%u.%u.%u puerto=%d codigo=%s", IP4(ip), g_cfg.port, code);
 
     lfd = tcp_listen(g_cfg.port);
     if (lfd < 0) { g_err = "NO PUDE ABRIR EL PUERTO"; return 0; }
 
-    snprintf(l2, sizeof l2, "PUERTO %d", g_cfg.port);
+    snprintf(l2, sizeof l2, "PUERTO TCP %d", g_cfg.port);
+    col3 = 0xFFFFC040;
+    if (!g_cfg.upnp)                                   snprintf(l3, sizeof l3, "UPNP APAGADO: ABRE EL PUERTO");
+    else if (!up.router)                               snprintf(l3, sizeof l3, "SIN UPNP: ABRE EL PUERTO A MANO");
+    else if (up.public_ip && ip_privada(up.public_ip)) snprintf(l3, sizeof l3, "ROUTER SIN IP PUBLICA (CGNAT)");
+    else if (mism)                                     snprintf(l3, sizeof l3, "ROUTER E INTERNET: IP DISTINTA");
+    else if (up.opened)                              { snprintf(l3, sizeof l3, "UPNP: PUERTO ABIERTO"); col3 = 0xFF80FF80; }
+    else                                               snprintf(l3, sizeof l3, "UPNP RECHAZADO: ABRE EL PUERTO");
+    logf_("estado en pantalla: %s", l3);
     g_stage = "esperando-amigo";
     for (;;) {
         uint16_t e;
@@ -1690,19 +2009,29 @@ static int run_host(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.5", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.6", 2, 0xFFFFD040);
         ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
         ui_center(84, code, 2, 0xFFFFFF40);
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
         ui_center(136, l2, 1, 0xFFC0C0FF);
-        ui_center(170, "ESPERANDO AL AMIGO...", 1, 0xFFFFFFFF);
+        ui_center(154, l3, 1, col3);
+        ui_center(176, "ESPERANDO AL AMIGO...", 1, 0xFFFFFFFF);
         ui_center(200, "O: CANCELAR", 1, 0xFF8080A0);
         present();
         {
             int r = fd_wait(lfd, POLLIN, 0);
             if (r > 0) {
-                int c = accept(lfd, NULL, NULL);
-                if (c >= 0) { g_net = c; sock_nodelay(c); break; }
+                struct sockaddr_in pa;
+                socklen_t pl = sizeof pa;
+                int c;
+                memset(&pa, 0, sizeof pa);
+                c = accept(lfd, (struct sockaddr *)&pa, &pl);
+                if (c >= 0) {
+                    uint32_t pip = ntohl(pa.sin_addr.s_addr);
+                    logf_("conexion entrante de %u.%u.%u.%u", IP4(pip));
+                    g_net = c; sock_nodelay(c); break;
+                }
+                logf_("accept fallo (errno=%d)", errno);
             }
 #ifdef NESNET_HOST
             sleep_ms(16);
@@ -1715,6 +2044,13 @@ static int run_host(void)
     return run_online(1, D);
 }
 
+static int run_host(void)
+{
+    int ok = run_host_inner();
+    upnp_close();
+    return ok;
+}
+
 static int run_client(void)
 {
     char code[20];
@@ -1724,17 +2060,21 @@ static int run_client(void)
     if (g_cfg.code[0]) snprintf(code, sizeof code, "%s", g_cfg.code);
     else if (!ui_enter_code(code)) { g_err = ""; return 1; }
 
-    if (!code_decode(code, &ip, &port)) { g_err = "CODIGO INVALIDO"; return 0; }
+    if (!code_decode(code, &ip, &port)) { logf_("codigo escrito=%s: INVALIDO", code); g_err = "CODIGO INVALIDO"; return 0; }
+    logf_("codigo escrito=%s -> destino %u.%u.%u.%u:%d", code, IP4(ip), port);
     net_ensure();
     g_stage = "conectando";
     {
         char l2[48];
-        snprintf(l2, sizeof l2, "%u.%u.%u.%u:%d", (unsigned)(ip >> 24), (unsigned)((ip >> 16) & 255),
-                 (unsigned)((ip >> 8) & 255), (unsigned)(ip & 255), port);
+        snprintf(l2, sizeof l2, "%u.%u.%u.%u:%d", IP4(ip), port);
         ui_show("CONECTANDO...", l2, NULL);
     }
     g_net = tcp_connect(ip, port, 10000);
-    if (g_net < 0) { g_err = "NO PUDE CONECTAR CON EL HOST"; return 0; }
+    if (g_net < 0) {
+        g_err = g_conn_kind == 1 ? "SIN RESPUESTA DEL HOST (10 S)" : "EL HOST RECHAZO LA CONEXION";
+        return 0;
+    }
+    logf_("connect OK en %u ms", (unsigned)g_conn_ms);
     ui_show("CONECTADO", "SINCRONIZANDO...", NULL);
     if (!handshake_client(&D)) { net_close(); return 0; }
     return run_online(0, D);
@@ -1771,7 +2111,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("NesNet v1.5 - dir=%s", g_dir);
+    logf_("NesNet v1.6 - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
 }
@@ -1880,7 +2220,7 @@ int main(int argc, char **argv)
         static const char *items[3] = { "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS" };
         int i;
         ui_clear();
-        ui_center(20, "NESNET V1.5", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.6", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         for (i = 0; i < 3; i++) {
             char line[40];
@@ -1892,7 +2232,7 @@ int main(int argc, char **argv)
             char code[20];
             code_encode(((uint32_t)181 << 24) | (45u << 16) | (200u << 8) | 17u, 7777, code);
             ui_clear();
-            ui_center(20, "NESNET V1.5", 2, 0xFFFFD040);
+            ui_center(20, "NESNET V1.6", 2, 0xFFFFD040);
             ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
             ui_center(84, code, 2, 0xFFFFFF40);
             ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
