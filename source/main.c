@@ -447,6 +447,7 @@ static void au_close(void) {}
 #endif
 
 /* AUDIO-GENERIC-BEGIN */
+static int      g_volume = 100;        /* v1.9: volumen 0..100 (100 = igual que siempre) */
 static void au_reset(void)
 {
     g_aq_head = 0; g_aq_cnt = 0; g_aq_pos = 0.0;
@@ -683,7 +684,6 @@ static int g_map[2][MA_COUNT] = {
 };
 static unsigned g_turbo_cnt[2][2];     /* cuadros seguidos que lleva apretado cada turbo (A, B) de cada mando */
 static int      g_screen;              /* 0 = original (pixeles cuadrados, como hasta ahora), 1 = 4:3 real, 2 = 16:9 estirada */
-static int      g_volume = 100;        /* v1.9: volumen 0..100 (100 = igual que siempre) */
 static int      g_netinfo;             /* v1.9: info de red en partida: 0 = solo al inicio (como siempre), 1 = siempre, 2 = no */
 static char     g_last_rom[ROM_NAMELEN];   /* v1.9: nombre del archivo de la ultima ROM elegida */
 
@@ -1167,10 +1167,13 @@ static padData *pad_read(int port)
     padInfo pi;
     padData d;
     ioPadGetInfo(&pi);
-    if (!pi.status[port]) { memset(&g_pd[port], 0, sizeof g_pd[port]); return &g_pd[port]; }
+    /* v1.9: un mando apagado/desconectado (o sin lectura todavia) debe quedar con las palancas en el CENTRO (128).
+     * Con 0 la palanca parecia empujada a la izquierda/arriba y el jugador 2 se movia solo (error de la v1.8.1 en adelante). */
+    if (!pi.status[port]) { memset(&g_pd[port], 0, sizeof g_pd[port]); g_pd[port].ANA_L_H = g_pd[port].ANA_L_V = g_pd[port].ANA_R_H = g_pd[port].ANA_R_V = 128; return &g_pd[port]; }
     memset(&d, 0, sizeof d);
     ioPadGetData(port, &d);
     if (d.len > 0) g_pd[port] = d;
+    else if (!g_pd[port].ANA_L_H && !g_pd[port].ANA_L_V) g_pd[port].ANA_L_H = g_pd[port].ANA_L_V = g_pd[port].ANA_R_H = g_pd[port].ANA_R_V = 128;   /* aun sin lectura valida */
     return &g_pd[port];
 }
 
@@ -1407,7 +1410,7 @@ static int read_whole_file(const char *path, uint8_t **buf, size_t *size)
 /* ------------------------------------------------------------------ */
 /* Selector de ROMs (v1.7): USRDIR/roms/, reconocidas por su cabecera  */
 /* ------------------------------------------------------------------ */
-typedef struct { char name[ROM_NAMELEN]; } RomEnt;
+typedef struct { char name[ROM_NAMELEN]; uint32_t size; uint32_t crc; int has_crc; } RomEnt;   /* v1.9: tamano y CRC32 (el CRC se calcula al detenerse el cursor) */
 static RomEnt g_roms[ROM_MAX];
 static int    g_nroms;
 
@@ -1462,6 +1465,12 @@ static void roms_scan(void)
         snprintf(path, sizeof path, "%s/%s", dir, e->d_name);
         if (!is_nes_file(path)) continue;
         snprintf(g_roms[g_nroms].name, ROM_NAMELEN, "%s", e->d_name);
+        {
+            struct stat st;
+            g_roms[g_nroms].size = stat(path, &st) == 0 ? (uint32_t)st.st_size : 0;
+            g_roms[g_nroms].crc = 0;
+            g_roms[g_nroms].has_crc = 0;
+        }
         g_nroms++;
     }
     closedir(d);
@@ -2390,6 +2399,30 @@ static int solo_menu(void)
 
 /* role: 0 = host (P1), 1 = cliente (P2), -1 = local directo (2 mandos),
  *       -2 = referencia de pruebas: local con el mismo retraso D     */
+/* v1.9: info de red en partida (solo dibujo; no toca la red). Mide cuanto tarda cada cuadro: si el juego tiene que
+ * esperar al otro lado, el cuadro tarda mas de 24 ms (a 60 cuadros por segundo lo normal son 17 ms). */
+static uint32_t g_ni_last, g_ni_t0, g_ni_n, g_ni_stall, g_ni_fps, g_ni_st;
+
+static void netinfo_tick(void)
+{
+    uint32_t now = now_ms();
+    if (g_ni_last && now - g_ni_last > 24 && now - g_ni_last < 1000) g_ni_stall++;   /* >1 s = menu abierto, no cuenta */
+    g_ni_last = now;
+    g_ni_n++;
+    if (g_ni_t0 == 0 || now - g_ni_t0 >= 1000) {
+        if (g_ni_t0) { g_ni_fps = g_ni_n; g_ni_st = g_ni_stall; }
+        g_ni_n = 0; g_ni_stall = 0; g_ni_t0 = now;
+    }
+}
+
+static int netinfo_show(uint32_t frame)
+{
+    if (g_desyncs) return 1;                 /* el aviso rojo de desync siempre sale */
+    if (g_netinfo == 2) return 0;
+    if (g_netinfo == 1) return 1;
+    return frame < 300;                      /* por defecto: como siempre, los primeros ~5 s */
+}
+
 static int session_loop(int role, int D, uint32_t maxframes)
 {
     uint16_t loc[RING], rem[RING];
@@ -2490,12 +2523,14 @@ static int session_loop(int role, int D, uint32_t maxframes)
         if (role >= 0) COMPARE(frame);
         g_run_hash = fnv_u32(g_run_hash, g_frame_crc);
 
-        if (role >= 0 && (g_desyncs || frame < 300)) {
+        if (role >= 0 && netinfo_show(frame)) {
             if (g_desyncs) snprintf(ov, sizeof ov, "DESYNC EN FRAME %u", (unsigned)g_first_desync);
+            else if (g_netinfo == 1) snprintf(ov, sizeof ov, "P%d DELAY %d (%dMS) FPS %u TRABAS %u", role + 1, D, D * 17, (unsigned)g_ni_fps, (unsigned)g_ni_st);
             else snprintf(ov, sizeof ov, "NESNET  P%d  DELAY %d", role + 1, D);
             ui_text(2, 2, ov, 1, g_desyncs ? 0xFFFF4040 : 0xFFFFFFFF);
         }
         present();
+        if (role >= 0 && g_netinfo == 1) netinfo_tick();
         frame++;
         g_frames_done = frame;
         if (role == -1 && (frame % 300) == 0) sram_save(0);      /* v1.9: guardado de bateria cada ~5 s si cambio (solo SOLO) */
@@ -2634,12 +2669,14 @@ static int session_loop4(int role, int D, uint32_t maxframes)
         if (role >= 0) COMPARE4(frame);
         g_run_hash = fnv_u32(g_run_hash, g_frame_crc);
 
-        if (role >= 0 && (g_desyncs || frame < 300)) {
+        if (role >= 0 && netinfo_show(frame)) {
             if (g_desyncs) snprintf(ov, sizeof ov, "DESYNC EN FRAME %u", (unsigned)g_first_desync);
+            else if (g_netinfo == 1) snprintf(ov, sizeof ov, "4J %s DELAY %d (%dMS) FPS %u TRABAS %u", role == 0 ? "P1+P2" : "P3+P4", D, D * 17, (unsigned)g_ni_fps, (unsigned)g_ni_st);
             else snprintf(ov, sizeof ov, "NESNET 4J  %s  DELAY %d", role == 0 ? "P1+P2" : "P3+P4", D);
             ui_text(2, 2, ov, 1, g_desyncs ? 0xFFFF4040 : 0xFFFFFFFF);
         }
         present();
+        if (role >= 0 && g_netinfo == 1) netinfo_tick();
         frame++;
         g_frames_done = frame;
     }
@@ -2670,7 +2707,7 @@ out:
 static void ui_show(const char *l1, const char *l2, const char *l3)
 {
     ui_clear();
-    ui_center(20, "NESNET V1.8.2", 2, 0xFFFFD040);
+    ui_center(20, "NESNET V1.9", 2, 0xFFFFD040);
     if (l1) ui_center(90, l1, 1, 0xFFFFFFFF);
     if (l2) ui_center(110, l2, 1, 0xFFC0C0FF);
     if (l3) ui_center(130, l3, 1, 0xFFC0C0FF);
@@ -2706,8 +2743,8 @@ static void fit_name(char *dst, size_t cap, const char *src, int maxc)
 /* Selector de ROM: lista de USRDIR/roms. 1 = eligio y cargo una ROM, 0 = volvio sin elegir */
 static int ui_rom_select(void)
 {
-    enum { VIS = 11 };
-    int sel = 0, top = 0, i;
+    enum { VIS = 9 };
+    int sel = 0, top = 0, i, last_sel = -1, hold = 0;
     g_stage = "elegir-rom";
     roms_scan();
     for (i = 0; i < g_nroms; i++) if (g_rom_name[0] && !strcmp(g_roms[i].name, g_rom_name)) sel = i;
@@ -2724,11 +2761,25 @@ static int ui_rom_select(void)
             if (e & UI_RIGHT) sel = sel + 10 >= g_nroms ? g_nroms - 1 : sel + 10;
             if (e & (UI_OK | UI_START)) {
                 ui_show("CARGANDO ROM...", g_roms[sel].name, NULL);
-                if (rom_load(sel)) return 1;
+                if (rom_load(sel)) {
+                    snprintf(g_last_rom, sizeof g_last_rom, "%s", g_rom_name);     /* v1.9: la recuerda para la proxima vez */
+                    opts_save();
+                    return 1;
+                }
                 ui_message("NO PUDE LEER LA ROM", g_roms[sel].name, 300);
             }
             if (sel < top) top = sel;
             if (sel >= top + VIS) top = sel - VIS + 1;
+            /* v1.9: el CRC32 se calcula cuando el cursor se queda ~0,2 s sobre una ROM (no al pasar rapido) */
+            if (sel != last_sel) { last_sel = sel; hold = 0; }
+            else if (hold < 1000) hold++;
+            if (hold == 12 && !g_roms[sel].has_crc) {
+                uint8_t *b = NULL;
+                size_t bs = 0;
+                char rp[420];
+                snprintf(rp, sizeof rp, "%s/roms/%s", g_dir, g_roms[sel].name);
+                if (read_whole_file(rp, &b, &bs)) { g_roms[sel].crc = crc32_buf(b, bs); g_roms[sel].has_crc = 1; free(b); }
+            }
         }
         ui_clear();
         ui_center(14, "ELEGIR ROM", 2, 0xFFFFD040);
@@ -2744,13 +2795,26 @@ static int ui_rom_select(void)
                 int k = top + i;
                 fit_name(nm, sizeof nm, g_roms[k].name, 38);
                 snprintf(line, sizeof line, "%s %s", k == sel ? ">" : " ", nm);
-                ui_text(8, 54 + i * 13, line, 1, k == sel ? 0xFFFFFFFF : 0xFF8080A0);
+                ui_text(8, 52 + i * 12, line, 1, k == sel ? 0xFFFFFFFF : 0xFF8080A0);
             }
-            if (top > 0)              ui_text(244, 54, "^", 1, 0xFFC0C0FF);
-            if (top + VIS < g_nroms)  ui_text(244, 54 + (VIS - 1) * 13, "V", 1, 0xFFC0C0FF);
+            if (top > 0)              ui_text(244, 52, "^", 1, 0xFFC0C0FF);
+            if (top + VIS < g_nroms)  ui_text(244, 52 + (VIS - 1) * 12, "V", 1, 0xFFC0C0FF);
+            {
+                /* v1.9: nombre completo de la ROM marcada (hasta 2 lineas de 40 letras), tamano y CRC32 */
+                const char *full = g_roms[sel].name;
+                size_t fl = strlen(full);
+                char l1[48], l2[48], l3[64], crc[12];
+                snprintf(l1, sizeof l1, "%.40s", full);
+                if (fl > 40) fit_name(l2, sizeof l2, full + 40, 40); else l2[0] = 0;
+                if (g_roms[sel].has_crc) snprintf(crc, sizeof crc, "%08X", (unsigned)g_roms[sel].crc); else snprintf(crc, sizeof crc, "........");
+                snprintf(l3, sizeof l3, "%u KB    CRC32 %s", (unsigned)((g_roms[sel].size + 512) / 1024), crc);
+                ui_text(8, 164, l1, 1, 0xFFFFD040);
+                if (l2[0]) ui_text(8, 175, l2, 1, 0xFFFFD040);
+                ui_text(8, 188, l3, 1, 0xFFC0C0FF);
+            }
         }
-        if (g_nroms) ui_center(198, "IZQ/DER: SALTAR 10", 1, 0xFF8080A0);
-        ui_center(212, g_nroms ? "X: ELEGIR   O: VOLVER" : "O: VOLVER", 1, 0xFF8080A0);
+        if (g_nroms) ui_center(204, "IZQ/DER: SALTAR 10", 1, 0xFF8080A0);
+        ui_center(218, g_nroms ? "X: ELEGIR   O: VOLVER" : "O: VOLVER", 1, 0xFF8080A0);
         present();
 #ifdef NESNET_HOST
         sleep_ms(16);
@@ -2873,9 +2937,77 @@ static void ui_opt_pads(void)
     }
 }
 
+/* v1.9: OPCIONES > SONIDO (volumen 0 a 100, de 10 en 10; se guarda solo). En el menu no suena nada: se oye al jugar. */
+static void ui_opt_sound(void)
+{
+    int i;
+    g_stage = "opciones-sonido";
+    ui_prime();
+    while (g_running) {
+        uint16_t e;
+        char line[48], bar[16];
+        pump();
+        e = ui_edges();
+        if (e & (UI_LEFT | UI_DOWN))  { g_volume = g_volume - 10 < 0 ? 0 : g_volume - 10; opts_save(); }
+        if (e & (UI_RIGHT | UI_UP))   { g_volume = g_volume + 10 > 100 ? 100 : g_volume + 10; opts_save(); }
+        if (e & (UI_OK | UI_CANCEL | UI_START)) break;
+        ui_clear();
+        ui_center(20, "SONIDO", 2, 0xFFFFD040);
+        snprintf(line, sizeof line, "VOLUMEN  %d%%", g_volume);
+        ui_center(76, line, 2, 0xFFFFFFFF);
+        for (i = 0; i < 10; i++) bar[i] = (char)(i < g_volume / 10 ? '#' : '-');
+        bar[10] = 0;
+        ui_center(108, bar, 2, 0xFF80FF80);
+        ui_center(140, g_volume == 0 ? "SILENCIO" : "100% ES EL VOLUMEN DE SIEMPRE", 1, 0xFFC0C0FF);
+        if (!g_cfg.audio) ui_center(158, "AVISO: SONIDO APAGADO (R2 AL ABRIR)", 1, 0xFFFFC040);
+        ui_center(190, "IZQ/DER: BAJAR / SUBIR", 1, 0xFF8080A0);
+        ui_center(204, "X / O: VOLVER", 1, 0xFF8080A0);
+        present();
+#ifdef NESNET_HOST
+        sleep_ms(16);
+#endif
+    }
+    logf_("opciones: volumen = %d", g_volume);
+}
+
+/* v1.9: OPCIONES > INFO DE RED: que se ve arriba a la izquierda durante una partida online (no cambia la red, solo lo que se dibuja) */
+static void ui_opt_netinfo(void)
+{
+    static const char *names[3] = { "SOLO AL INICIO (5 S)", "SIEMPRE", "NO MOSTRAR" };
+    static const char *desc[3] = { "COMO HASTA AHORA", "DELAY, FPS Y TRABAS EN VIVO", "SOLO SALE EL AVISO ROJO DE DESYNC" };
+    int i;
+    g_stage = "opciones-info-red";
+    ui_prime();
+    while (g_running) {
+        uint16_t e;
+        pump();
+        e = ui_edges();
+        if (e & UI_UP)   { g_netinfo = (g_netinfo + 2) % 3; opts_save(); }
+        if (e & UI_DOWN) { g_netinfo = (g_netinfo + 1) % 3; opts_save(); }
+        if (e & (UI_OK | UI_CANCEL | UI_START)) break;
+        ui_clear();
+        ui_center(20, "INFO DE RED", 2, 0xFFFFD040);
+        ui_center(46, "EN PARTIDA ONLINE (ARRIBA A LA IZQUIERDA)", 1, 0xFFC0C0FF);
+        for (i = 0; i < 3; i++) {
+            char line[48];
+            snprintf(line, sizeof line, "%s %s", i == g_netinfo ? ">" : " ", names[i]);
+            ui_center(84 + i * 22, line, 1, i == g_netinfo ? 0xFFFFFFFF : 0xFF8080A0);
+        }
+        ui_center(156, desc[g_netinfo], 1, 0xFF80FF80);
+        ui_center(176, "DELAY = CUADROS DE ESPERA (1 CUADRO = 17 MS)", 1, 0xFF8080A0);
+        ui_center(190, "TRABAS = CUADROS LENTOS EN EL ULTIMO SEGUNDO", 1, 0xFF8080A0);
+        ui_center(210, "ARRIBA/ABAJO   X / O: VOLVER", 1, 0xFF8080A0);
+        present();
+#ifdef NESNET_HOST
+        sleep_ms(16);
+#endif
+    }
+    logf_("opciones: info de red = %d", g_netinfo);
+}
+
 static void ui_options(void)
 {
-    static const char *items[3] = { "PANTALLA", "MANDOS (BOTONES Y TURBO)", "VOLVER" };
+    static const char *items[5] = { "PANTALLA", "MANDOS (BOTONES Y TURBO)", "SONIDO (VOLUMEN)", "INFO DE RED EN PARTIDA", "VOLVER" };
     int sel = 0, i;
     g_stage = "opciones";
     ui_prime();
@@ -2883,21 +3015,23 @@ static void ui_options(void)
         uint16_t e;
         pump();
         e = ui_edges();
-        if (e & UI_UP)   sel = (sel + 2) % 3;
-        if (e & UI_DOWN) sel = (sel + 1) % 3;
+        if (e & UI_UP)   sel = (sel + 4) % 5;
+        if (e & UI_DOWN) sel = (sel + 1) % 5;
         if (e & UI_CANCEL) break;
         if (e & (UI_OK | UI_START)) {
             if (sel == 0) { ui_opt_screen(); ui_prime(); g_stage = "opciones"; }
             else if (sel == 1) { ui_opt_pads(); ui_prime(); g_stage = "opciones"; }
+            else if (sel == 2) { ui_opt_sound(); ui_prime(); g_stage = "opciones"; }
+            else if (sel == 3) { ui_opt_netinfo(); ui_prime(); g_stage = "opciones"; }
             else break;
         }
         ui_clear();
         ui_center(20, "OPCIONES", 2, 0xFFFFD040);
         ui_center(46, "SE GUARDAN SOLAS", 1, 0xFFC0C0FF);
-        for (i = 0; i < 3; i++) {
+        for (i = 0; i < 5; i++) {
             char line[40];
             snprintf(line, sizeof line, "%s %s", i == sel ? ">" : " ", items[i]);
-            ui_center(84 + i * 22, line, 1, i == sel ? 0xFFFFFFFF : 0xFF8080A0);
+            ui_center(76 + i * 20, line, 1, i == sel ? 0xFFFFFFFF : 0xFF8080A0);
         }
         ui_center(200, "ARRIBA/ABAJO + X", 1, 0xFF8080A0);
         ui_center(214, "O: VOLVER", 1, 0xFF8080A0);
@@ -2928,7 +3062,7 @@ static int ui_menu(void)
             else return modes[g_menu_sel];
         }
         ui_clear();
-        ui_center(20, "NESNET V1.8.2", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         if (g_rom) {
             fit_name(nm, sizeof nm, g_rom_name, 34);
@@ -2970,7 +3104,7 @@ static int ui_menu4(void)
         if (e & UI_CANCEL) return -1;
         if (e & (UI_OK | UI_START)) return sel == 0 ? MODE_HOST : sel == 1 ? MODE_JOIN : -1;
         ui_clear();
-        ui_center(20, "NESNET V1.8.2", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9", 2, 0xFFFFD040);
         ui_center(46, "MULTIJUGADOR DE 4 (FOUR SCORE)", 1, 0xFFC0C0FF);
         ui_center(66, "HOST: MANDOS 1 Y 2", 1, 0xFF80FF80);
         ui_center(80, "EL QUE SE UNE: MANDOS 3 Y 4", 1, 0xFF80FF80);
@@ -3011,7 +3145,7 @@ static int ui_enter_code(char *out)
         for (i = 0; i < 15; i++) digits[i] = (char)('0' + d[i]);
         digits[15] = 0;
         ui_clear();
-        ui_center(20, "NESNET V1.8.2", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9", 2, 0xFFFFD040);
         ui_center(60, "ESCRIBE EL CODIGO DEL HOST", 1, 0xFFFFFFFF);
         for (i = 0; i < 15; i++) {
             char c[2] = { digits[i], 0 };
@@ -3105,7 +3239,7 @@ static int run_host_inner(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.8.2", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9", 2, 0xFFFFD040);
         ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
         ui_center(84, code, 2, 0xFFFFFF40);
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -3246,7 +3380,7 @@ static int run_host4_inner(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.8.2", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9", 2, 0xFFFFD040);
         ui_center(64, "SALA DE 4 - TU CODIGO:", 1, 0xFFFFFFFF);
         ui_center(84, code, 2, 0xFFFFFF40);
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -3351,7 +3485,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("NesNet v1.8.2 - dir=%s", g_dir);
+    logf_("NesNet v1.9 - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
@@ -3367,6 +3501,15 @@ static int app_main(const char *argv0)
     logf_("stand-by: sin ROM elegida (roms en %s/roms)", g_dir);
 
     core_boot();
+
+    /* v1.9: si hay una ultima ROM recordada y el archivo sigue en la carpeta, queda ya elegida (el juego sigue sin arrancar) */
+    if (g_last_rom[0]) {
+        int i, found = -1;
+        roms_scan();
+        for (i = 0; i < g_nroms; i++) if (!strcmp(g_roms[i].name, g_last_rom)) found = i;
+        if (found >= 0 && rom_load(found)) { logf_("ultima ROM recordada y cargada: %s", g_rom_name); g_menu_sel = 1; }
+        else logf_("la ultima ROM recordada (%s) ya no esta o no se pudo leer: stand-by", g_last_rom);
+    }
 
     from_cfg = g_cfg.mode[0] != 0;
     if (from_cfg) { logf_("config.txt trae mode=%s: se ignora, primero hay que elegir ROM en el menu", g_cfg.mode); from_cfg = 0; }
@@ -3471,7 +3614,7 @@ int main(int argc, char **argv)
         static const char *items[3] = { "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS" };
         int i;
         ui_clear();
-        ui_center(20, "NESNET V1.8.2", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         for (i = 0; i < 3; i++) {
             char line[40];
@@ -3483,7 +3626,7 @@ int main(int argc, char **argv)
             char code[20];
             code_encode(((uint32_t)181 << 24) | (45u << 16) | (200u << 8) | 17u, 7777, code);
             ui_clear();
-            ui_center(20, "NESNET V1.8.2", 2, 0xFFFFD040);
+            ui_center(20, "NESNET V1.9", 2, 0xFFFFD040);
             ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
             ui_center(84, code, 2, 0xFFFFFF40);
             ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -3502,6 +3645,7 @@ int main(int argc, char **argv)
     g_maxframes = frames;
     if (getenv("NESNET_UI")) { g_ui_script = getenv("NESNET_UI"); g_ui_has_script = 1; }   /* pruebas del menu de salir */
     if (getenv("NESNET_R2")) g_exit_at = (uint32_t)atoi(getenv("NESNET_R2"));
+    if (getenv("NESNET_NETINFO")) g_netinfo = atoi(getenv("NESNET_NETINFO"));   /* prueba: modo de info de red */
     signal(SIGPIPE, SIG_IGN);
     if (!strcmp(mode, "app")) {
         /* flujo real: lee DIR/config.txt y ejecuta app_main (argv[4] = carpeta) */
