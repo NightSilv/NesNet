@@ -75,6 +75,14 @@ int closesocket(int s);      /* definida en libnet, pero sin prototipo en las ca
 #define MODE_HOST      1
 #define MODE_JOIN      2
 #define MODE_ROM       3      /* v1.7: opcion "ELEGIR ROM" del menu (no es un modo de juego) */
+#define MODE_FOUR      4      /* v1.8: opcion "MULTIJUGADOR DE 4" (submenu con host y unirse) */
+
+/* v1.8: el modo de 4 jugadores es una COPIA aparte del 1vs1 y habla otro protocolo, asi un host de 1vs1
+ * nunca acepta a alguien del modo de 4 (ni al reves). El 1vs1 sigue con PROTO_VER 1, igual que la v1.7. */
+#define PROTO_VER4     2
+
+/* FCEUmm define su "GAMEPAD" como subclase 1 del mando (RETRO_DEVICE_GAMEPAD en su libretro.c) */
+#define NES_DEV_GAMEPAD RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_JOYPAD, 1)
 
 /* v1.7: selector de ROMs. Las ROMs van en USRDIR/roms/ y se reconocen por su cabecera, no por el nombre */
 #define ROM_MAX        256
@@ -129,7 +137,8 @@ static char     g_rom_name[ROM_NAMELEN];  /* v1.7: nombre del archivo de la ROM 
 static int      g_menu_sel;               /* v1.7: opcion marcada del menu principal */
 
 static uint32_t g_fb[SCR_W * SCR_H];      /* lienzo ARGB */
-static uint16_t g_pad[2];                 /* entrada NES que ve el nucleo */
+static uint16_t g_pad[4];                 /* entrada NES que ve el nucleo (v1.8: 4 puertos; el 1vs1 solo usa 0 y 1) */
+static int      g_four;                   /* v1.8: 1 = partida de 4 jugadores (Four Score), 0 = 1vs1 como siempre */
 static unsigned g_pixfmt = RETRO_PIXEL_FORMAT_RGB565;
 static uint32_t g_frame_crc;
 static int      g_core_loaded;
@@ -1119,7 +1128,7 @@ static int16_t input_state_cb(unsigned port, unsigned dev, unsigned idx, unsigne
 {
     unsigned bit;
     (void)idx;
-    if (port > 1 || dev != RETRO_DEVICE_JOYPAD) return 0;
+    if (port > (g_four ? 3u : 1u) || dev != RETRO_DEVICE_JOYPAD) return 0;
     switch (id) {
     case RETRO_DEVICE_ID_JOYPAD_A:      bit = 0; break;
     case RETRO_DEVICE_ID_JOYPAD_B:      bit = 1; break;
@@ -1266,6 +1275,33 @@ static int core_load(void)
     return 1;
 }
 
+/* v1.8: copia de core_load() para el modo de 4. Declara los puertos 3 y 4 como mando (GAMEPAD): con eso FCEUmm
+ * enciende solo el adaptador Four Score. Los juegos que no lo usan simplemente ignoran los mandos 3 y 4. */
+static int core_load4(void)
+{
+    struct retro_game_info gi;
+    if (g_core_loaded) return 1;
+    memset(&gi, 0, sizeof gi);
+    gi.path = g_cfg.rom;
+    gi.data = g_rom;
+    gi.size = g_romsz;
+    if (!retro_load_game(&gi)) { g_err = "EL NUCLEO NO PUDO CARGAR LA ROM"; return 0; }
+    retro_set_controller_port_device(0, RETRO_DEVICE_JOYPAD);
+    retro_set_controller_port_device(1, RETRO_DEVICE_JOYPAD);
+    retro_set_controller_port_device(2, NES_DEV_GAMEPAD);   /* GAMEPAD de FCEUmm */
+    retro_set_controller_port_device(3, NES_DEV_GAMEPAD);
+    logf_("4 jugadores: puertos 3 y 4 como mando (Four Score)");
+    {
+        struct retro_system_av_info av;
+        memset(&av, 0, sizeof av);
+        retro_get_system_av_info(&av);
+        if (av.timing.sample_rate >= 8000.0 && av.timing.sample_rate <= 96000.0) g_au_inrate = av.timing.sample_rate;
+        logf_("audio: el nucleo entrega %d Hz a %d cuadros/s", (int)g_au_inrate, (int)(av.timing.fps + 0.5));
+    }
+    g_core_loaded = 1;
+    return 1;
+}
+
 static void core_unload(void)
 {
     if (g_core_loaded) { retro_unload_game(); g_core_loaded = 0; }
@@ -1275,6 +1311,16 @@ static void step_frame(uint16_t p1, uint16_t p2)
 {
     g_pad[0] = p1;
     g_pad[1] = p2;
+    retro_run();
+}
+
+/* v1.8: copia de step_frame() para 4 mandos */
+static void step_frame4(uint16_t p1, uint16_t p2, uint16_t p3, uint16_t p4)
+{
+    g_pad[0] = p1;
+    g_pad[1] = p2;
+    g_pad[2] = p3;
+    g_pad[3] = p4;
     retro_run();
 }
 
@@ -1842,6 +1888,78 @@ static int handshake_client(int *outD)
     return 0;
 }
 
+/* v1.8: COPIA de handshake_host / handshake_client para el modo de 4 (protocolo PROTO_VER4). Misma logica. */
+static int handshake_host4(int *outD)
+{
+    Msg m;
+    uint32_t rtt[5];
+    int i, D, r;
+
+    r = net_recv(&m, 10000);
+    if (r <= 0 || m.type != M_HELLO) { g_err = "EL AMIGO NO RESPONDIO"; return 0; }
+    if (m.frame != PROTO_VER4) {
+        memset(&m, 0, sizeof m); m.type = M_REJECT; m.v1 = 1; net_send(&m);
+        g_err = "AMIGO EN OTRO MODO O VERSION DISTINTA"; return 0;
+    }
+    if (m.v1 != g_romcrc) {
+        memset(&m, 0, sizeof m); m.type = M_REJECT; m.v1 = 2; net_send(&m);
+        g_err = "ROM DISTINTA A LA DEL AMIGO"; return 0;
+    }
+    memset(&m, 0, sizeof m); m.type = M_HELLO; m.frame = PROTO_VER4; m.v1 = g_romcrc;
+    if (!net_send(&m)) { g_err = "SE CORTO LA CONEXION"; return 0; }
+
+    for (i = 0; i < 5; i++) {
+        uint32_t t0 = now_ms();
+        memset(&m, 0, sizeof m); m.type = M_PING; m.v1 = (uint32_t)i;
+        if (!net_send(&m)) { g_err = "SE CORTO LA CONEXION"; return 0; }
+        r = net_recv(&m, 5000);
+        if (r <= 0 || m.type != M_PONG || m.v1 != (uint32_t)i) { g_err = "FALLO LA MEDICION DE LATENCIA"; return 0; }
+        rtt[i] = now_ms() - t0;
+    }
+    qsort(rtt, 5, sizeof rtt[0], cmp_u32);
+    D = g_cfg.delay > 0 ? g_cfg.delay : clamp_i((int)((rtt[2] / 2 + 16) / 17) + 2, 3, 12);
+    logf_("RTT mediana %u ms -> delay %d frames", (unsigned)rtt[2], D);
+
+    memset(&m, 0, sizeof m); m.type = M_CFG; m.v1 = (uint32_t)D; m.v2 = rtt[2];
+    if (!net_send(&m)) { g_err = "SE CORTO LA CONEXION"; return 0; }
+    memset(&m, 0, sizeof m); m.type = M_START;
+    if (!net_send(&m)) { g_err = "SE CORTO LA CONEXION"; return 0; }
+    *outD = D;
+    return 1;
+}
+
+static int handshake_client4(int *outD)
+{
+    Msg m;
+    int r, D = 0, haveD = 0;
+    uint32_t t0;
+
+    memset(&m, 0, sizeof m); m.type = M_HELLO; m.frame = PROTO_VER4; m.v1 = g_romcrc;
+    if (!net_send(&m)) { g_err = "SE CORTO LA CONEXION"; return 0; }
+    r = net_recv(&m, 10000);
+    if (r <= 0) { g_err = "EL HOST NO RESPONDIO"; return 0; }
+    if (m.type == M_REJECT) { g_err = (m.v1 == 2) ? "ROM DISTINTA A LA DEL HOST" : "ESA SALA NO ES DE 4 (O VERSION DISTINTA)"; return 0; }
+    if (m.type != M_HELLO) { g_err = "RESPUESTA INVALIDA DEL HOST"; return 0; }
+
+    t0 = now_ms();
+    while (now_ms() - t0 < 20000) {
+        r = net_recv(&m, 2000);
+        if (r < 0) { g_err = "SE CORTO LA CONEXION"; return 0; }
+        if (r == 0) continue;
+        if (m.type == M_PING) {
+            Msg p; memset(&p, 0, sizeof p); p.type = M_PONG; p.v1 = m.v1;
+            if (!net_send(&p)) { g_err = "SE CORTO LA CONEXION"; return 0; }
+        } else if (m.type == M_CFG) {
+            D = (int)m.v1; haveD = 1;
+        } else if (m.type == M_START && haveD) {
+            *outD = clamp_i(D, 1, 20);
+            return 1;
+        }
+    }
+    g_err = "TIEMPO AGOTADO EN EL INICIO";
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 /* Bucle de partida                                                    */
 /* ------------------------------------------------------------------ */
@@ -2016,12 +2134,162 @@ out:
 }
 
 /* ------------------------------------------------------------------ */
+/* v1.8: bucle de partida de 4 jugadores (COPIA adaptada de session_loop; el 1vs1 de arriba no se toca)  */
+/* Cada consola manda en un solo mensaje sus 2 mandos: byte bajo = mando 1 de esa consola, byte alto = mando 2.   */
+/* Host: mandos 1 y 2 (P1+P2). El que se une: mandos 3 y 4 (P3+P4).                                                */
+/* ------------------------------------------------------------------ */
+static uint16_t local_bits4(int role, uint32_t frame)
+{
+#ifdef NESNET_HOST
+    int base = role == 1 ? 2 : 0;           /* pruebas: host = jugadores 0 y 1, cliente = jugadores 2 y 3 */
+    return (uint16_t)(script_input(base, frame) | (script_input(base + 1, frame) << 8));
+#else
+    (void)role; (void)frame;
+    return (uint16_t)((pad_nes_bits(0) & 0xFF) | ((pad_nes_bits(1) & 0xFF) << 8));
+#endif
+}
+
+/* role: 0 = host (P1+P2), 1 = el que se une (P3+P4), -2 = referencia de pruebas: 4 jugadores locales con retraso D */
+static int session_loop4(int role, int D, uint32_t maxframes)
+{
+    uint16_t loc[RING], rem[RING];
+    uint8_t  have[RING];
+    uint32_t mine_f[RING], mine_c[RING], rem_f[RING], rem_c[RING];
+    uint32_t frame = 0, last_rx = now_ms();
+    int i, ended_ok = 1, peer_gone = 0, peer_quit = 0, user_exit = 0;
+    char ov[64];
+
+    memset(loc, 0, sizeof loc); memset(rem, 0, sizeof rem); memset(have, 0, sizeof have);
+    for (i = 0; i < RING; i++) { mine_f[i] = NO_FRAME; rem_f[i] = NO_FRAME; mine_c[i] = rem_c[i] = 0; }
+    if (role >= 0) for (i = 0; i < D; i++) have[i] = 1;
+
+    g_run_hash = 2166136261u; g_frames_done = 0; g_desyncs = 0; g_first_desync = NO_FRAME;
+    g_stage = role == 0 ? "juego4-host" : role == 1 ? "juego4-cliente" : "juego4-ref";
+
+#define COMPARE4(f) do { uint32_t _f = (f); \
+        if (mine_f[_f % RING] == _f && rem_f[_f % RING] == _f && \
+            mine_c[_f % RING] != rem_c[_f % RING]) { \
+            if (!g_desyncs) { g_first_desync = _f; logf_("DESYNC en frame %u", (unsigned)_f); } \
+            g_desyncs++; \
+            mine_f[_f % RING] = NO_FRAME; } } while (0)
+
+    (void)exit_pressed(1, 0);               /* ignora un R2 que siga apretado desde antes */
+
+    while (g_running && (maxframes == 0 || frame < maxframes)) {
+        uint16_t p1, p2, p3, p4;
+        pump();
+
+        /* R2 del mando 1 de esta consola abre el menu de salir (igual que en el 1vs1) */
+        if (role != -2 && exit_pressed(0, frame)) {
+            if (exit_menu(role >= 0)) { user_exit = 1; logf_("salida pedida por el jugador (R2) en frame %u", (unsigned)frame); goto out; }
+            last_rx = now_ms();
+        }
+
+        if (role == -2) {
+#ifdef NESNET_HOST
+            uint32_t f0 = frame >= (uint32_t)D ? frame - (uint32_t)D : 0;
+            int ok0 = frame >= (uint32_t)D;
+            p1 = ok0 ? script_input(0, f0) : 0;
+            p2 = ok0 ? script_input(1, f0) : 0;
+            p3 = ok0 ? script_input(2, f0) : 0;
+            p4 = ok0 ? script_input(3, f0) : 0;
+#else
+            p1 = p2 = p3 = p4 = 0;           /* la referencia solo existe en la version de pruebas (PC) */
+#endif
+        } else {
+            Msg m;
+            uint32_t tgt = frame + (uint32_t)D;
+            uint16_t bits = local_bits4(role, frame);
+            loc[tgt % RING] = bits;
+
+            memset(&m, 0, sizeof m);
+            m.type = M_INPUT; m.input = bits; m.frame = tgt;
+            if (frame > 0) { m.v1 = frame - 1; m.v2 = mine_c[(frame - 1) % RING]; } else { m.v1 = NO_FRAME; }
+            if (!peer_gone && !net_send(&m)) peer_gone = 1;   /* lo decide el bucle de espera */
+
+            for (;;) {
+                int r;
+                if (peer_gone) {
+                    /* el otro lado cerro: seguimos solo mientras queden entradas ya recibidas */
+                    if (have[frame % RING]) break;
+                    g_err = peer_quit ? "EL AMIGO SALIO DE LA PARTIDA" : "SE PERDIO LA CONEXION";
+                    ended_ok = 0; goto out;
+                }
+                r = net_recv(&m, have[frame % RING] ? 0 : 100);
+                if (r < 0) { if (!g_running) goto out; peer_gone = 1; continue; }
+                if (r == 0) {
+                    if (have[frame % RING]) break;
+                    if (!g_running) goto out;
+                    if (now_ms() - last_rx > 15000) { g_err = "EL AMIGO NO RESPONDE (15 S)"; ended_ok = 0; goto out; }
+                    continue;
+                }
+                last_rx = now_ms();
+                if (m.type == M_INPUT) {
+                    rem[m.frame % RING] = m.input;
+                    have[m.frame % RING] = 1;
+                    if (m.v1 != NO_FRAME) { rem_f[m.v1 % RING] = m.v1; rem_c[m.v1 % RING] = m.v2; COMPARE4(m.v1); }
+                } else if (m.type == M_QUIT) {
+                    peer_quit = 1; peer_gone = 1;
+                }
+            }
+            have[frame % RING] = 0;
+            {
+                uint16_t mine = loc[frame % RING], theirs = rem[frame % RING];
+                uint16_t hb = (role == 0) ? mine : theirs;      /* bytes del host */
+                uint16_t cb = (role == 0) ? theirs : mine;      /* bytes del que se une */
+                p1 = hb & 0xFF; p2 = (uint16_t)(hb >> 8);
+                p3 = cb & 0xFF; p4 = (uint16_t)(cb >> 8);
+            }
+        }
+
+#ifdef NESNET_HOST
+        { const char *b = getenv("NESNET_BREAK");        /* prueba: corrompe a proposito un frame */
+          if (b && role == 1 && frame >= (uint32_t)atoi(b) && frame < (uint32_t)atoi(b) + 30) p3 ^= 0xFF; }
+#endif
+        step_frame4(p1, p2, p3, p4);
+
+        mine_f[frame % RING] = frame;
+        mine_c[frame % RING] = g_frame_crc;
+        if (role >= 0) COMPARE4(frame);
+        g_run_hash = fnv_u32(g_run_hash, g_frame_crc);
+
+        if (role >= 0 && (g_desyncs || frame < 300)) {
+            if (g_desyncs) snprintf(ov, sizeof ov, "DESYNC EN FRAME %u", (unsigned)g_first_desync);
+            else snprintf(ov, sizeof ov, "NESNET 4J  %s  DELAY %d", role == 0 ? "P1+P2" : "P3+P4", D);
+            ui_text(2, 2, ov, 1, g_desyncs ? 0xFFFF4040 : 0xFFFFFFFF);
+        }
+        present();
+        frame++;
+        g_frames_done = frame;
+    }
+out:
+    if (role >= 0 && g_net >= 0) {
+        Msg q; memset(&q, 0, sizeof q); q.type = M_QUIT; net_send(&q);
+        if (user_exit) {
+            /* vacia lo que el otro lado alcance a mandar (hasta 300 ms o hasta que cierre), para que
+             * al cerrar el socket no se pierda el aviso de salida */
+            uint32_t t0 = now_ms();
+            while (now_ms() - t0 < 300) { if (net_recv(&q, 20) < 0) break; }
+        }
+    }
+#undef COMPARE4
+#ifdef NESNET_HOST
+    if (getenv("NESNET_RAMDUMP")) {            /* prueba: muestra lo que el juego leyo de los 4 mandos (RAM $00-$07) */
+        const uint8_t *ram = (const uint8_t *)retro_get_memory_data(RETRO_MEMORY_SYSTEM_RAM);
+        if (ram) printf("RAM role=%d: %02X %02X %02X %02X %02X %02X %02X %02X\n", role,
+                        ram[0], ram[1], ram[2], ram[3], ram[4], ram[5], ram[6], ram[7]);
+    }
+#endif
+    return ended_ok;
+}
+
+/* ------------------------------------------------------------------ */
 /* Interfaz                                                            */
 /* ------------------------------------------------------------------ */
 static void ui_show(const char *l1, const char *l2, const char *l3)
 {
     ui_clear();
-    ui_center(20, "NESNET V1.7", 2, 0xFFFFD040);
+    ui_center(20, "NESNET V1.8", 2, 0xFFFFD040);
     if (l1) ui_center(90, l1, 1, 0xFFFFFFFF);
     if (l2) ui_center(110, l2, 1, 0xFFC0C0FF);
     if (l3) ui_center(130, l3, 1, 0xFFC0C0FF);
@@ -2112,8 +2380,8 @@ static int ui_rom_select(void)
 
 static int ui_menu(void)
 {
-    static const char *items[4] = { "ELEGIR ROM", "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS" };
-    static const int modes[4] = { MODE_ROM, MODE_HOST, MODE_JOIN, MODE_SOLO };   /* mismo orden que items */
+    static const char *items[5] = { "ELEGIR ROM", "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS", "MULTIJUGADOR DE 4" };
+    static const int modes[5] = { MODE_ROM, MODE_HOST, MODE_JOIN, MODE_SOLO, MODE_FOUR };   /* mismo orden que items */
     int i;
     g_stage = "menu";
     ui_prime();
@@ -2122,15 +2390,15 @@ static int ui_menu(void)
         char l[80], nm[48];
         pump();
         e = ui_edges();
-        if (e & UI_UP)   g_menu_sel = (g_menu_sel + 3) % 4;
-        if (e & UI_DOWN) g_menu_sel = (g_menu_sel + 1) % 4;
+        if (e & UI_UP)   g_menu_sel = (g_menu_sel + 4) % 5;
+        if (e & UI_DOWN) g_menu_sel = (g_menu_sel + 1) % 5;
         if (e & (UI_OK | UI_START)) {
             /* sin ROM elegida el juego queda en stand-by: solo se puede entrar a ELEGIR ROM */
             if (modes[g_menu_sel] != MODE_ROM && !g_rom) ui_message("PRIMERO ELIGE UNA ROM", "OPCION: ELEGIR ROM", 120);
             else return modes[g_menu_sel];
         }
         ui_clear();
-        ui_center(20, "NESNET V1.7", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.8", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         if (g_rom) {
             fit_name(nm, sizeof nm, g_rom_name, 34);
@@ -2139,15 +2407,50 @@ static int ui_menu(void)
         } else {
             ui_center(66, "ROM: NINGUNA (ELIGE UNA)", 1, 0xFFFFC040);
         }
-        for (i = 0; i < 4; i++) {
+        for (i = 0; i < 5; i++) {
             char line[40];
             uint32_t col = i == g_menu_sel ? 0xFFFFFFFF : 0xFF8080A0;
             if (!g_rom && modes[i] != MODE_ROM) col = i == g_menu_sel ? 0xFFA0A0B0 : 0xFF505068;   /* bloqueadas sin ROM */
             snprintf(line, sizeof line, "%s %s", i == g_menu_sel ? ">" : " ", items[i]);
-            ui_center(96 + i * 22, line, 1, col);
+            ui_center(92 + i * 20, line, 1, col);
         }
         ui_center(200, "ARRIBA/ABAJO + X", 1, 0xFF8080A0);
         ui_center(214, "EN PARTIDA: R2 = SALIR", 1, 0xFF8080A0);
+        present();
+#ifdef NESNET_HOST
+        sleep_ms(16);
+#endif
+    }
+    return -1;
+}
+
+/* v1.8: submenu del modo de 4 jugadores. Devuelve MODE_HOST, MODE_JOIN o -1 (volver). Copia de la idea de ui_menu. */
+static int ui_menu4(void)
+{
+    static const char *items[3] = { "CREAR SALA DE 4 (HOST)", "UNIRSE A SALA DE 4", "VOLVER" };
+    int sel = 0, i;
+    g_stage = "menu-4";
+    ui_prime();
+    while (g_running) {
+        uint16_t e;
+        pump();
+        e = ui_edges();
+        if (e & UI_UP)   sel = (sel + 2) % 3;
+        if (e & UI_DOWN) sel = (sel + 1) % 3;
+        if (e & UI_CANCEL) return -1;
+        if (e & (UI_OK | UI_START)) return sel == 0 ? MODE_HOST : sel == 1 ? MODE_JOIN : -1;
+        ui_clear();
+        ui_center(20, "NESNET V1.8", 2, 0xFFFFD040);
+        ui_center(46, "MULTIJUGADOR DE 4 (FOUR SCORE)", 1, 0xFFC0C0FF);
+        ui_center(66, "HOST: MANDOS 1 Y 2", 1, 0xFF80FF80);
+        ui_center(80, "EL QUE SE UNE: MANDOS 3 Y 4", 1, 0xFF80FF80);
+        for (i = 0; i < 3; i++) {
+            char line[40];
+            snprintf(line, sizeof line, "%s %s", i == sel ? ">" : " ", items[i]);
+            ui_center(110 + i * 22, line, 1, i == sel ? 0xFFFFFFFF : 0xFF8080A0);
+        }
+        ui_center(190, "SOLO JUEGOS CON FOUR SCORE", 1, 0xFF8080A0);
+        ui_center(204, "EN PARTIDA: R2 = SALIR", 1, 0xFF8080A0);
         present();
 #ifdef NESNET_HOST
         sleep_ms(16);
@@ -2178,7 +2481,7 @@ static int ui_enter_code(char *out)
         for (i = 0; i < 15; i++) digits[i] = (char)('0' + d[i]);
         digits[15] = 0;
         ui_clear();
-        ui_center(20, "NESNET V1.7", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.8", 2, 0xFFFFD040);
         ui_center(60, "ESCRIBE EL CODIGO DEL HOST", 1, 0xFFFFFFFF);
         for (i = 0; i < 15; i++) {
             char c[2] = { digits[i], 0 };
@@ -2272,7 +2575,7 @@ static int run_host_inner(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.7", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.8", 2, 0xFFFFD040);
         ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
         ui_center(84, code, 2, 0xFFFFFF40);
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -2343,6 +2646,147 @@ static int run_client(void)
     return run_online(0, D);
 }
 
+/* v1.8: COPIAS de run_host_inner / run_host / run_client para el modo de 4. El 1vs1 de arriba no se toca. */
+/* v1.8: COPIA de run_online() para el modo de 4: carga el nucleo con 4 mandos (Four Score) y corre session_loop4 */
+static int run_online4(int is_host, int D)
+{
+    int ok;
+    g_four = 1;
+    if (!core_load4()) { g_four = 0; return 0; }
+    ok = session_loop4(is_host ? 0 : 1, D, g_maxframes);
+    core_unload();
+    g_four = 0;
+    net_close();
+    return ok;
+}
+
+static int run_host4_inner(void)
+{
+    uint32_t ip = 0;
+    char code[20], l2[48], l3[48];
+    int lfd, D = 0, got_ip = 0, mism = 0;
+    uint32_t col3;
+    Upnp up;
+
+    net_ensure();
+    memset(&up, 0, sizeof up);
+    if (g_cfg.upnp) {
+        g_stage = "upnp";
+        ui_show("CREANDO SALA...", "ABRIENDO EL PUERTO (UPNP)", NULL);
+        upnp_open(g_cfg.port, &up);
+        if (!g_running) return 1;
+    } else {
+        logf_("upnp: apagado (upnp=off en config.txt)");
+    }
+    g_stage = "buscando-ip";
+    ui_show("CREANDO SALA...", "BUSCANDO TU IP PUBLICA", NULL);
+    if (g_cfg.public_ip[0] && parse_ip(g_cfg.public_ip, &ip)) { got_ip = 1; logf_("IP publica fijada a mano (public_ip=)"); }
+    else if (get_public_ip(&ip)) got_ip = 1;
+    else logf_("ipify: no pude obtener la IP publica");
+    if (!got_ip && up.public_ip && !ip_privada(up.public_ip)) {
+        ip = up.public_ip; got_ip = 1;
+        logf_("uso la IP WAN que dio el router por UPnP");
+    }
+    if (!got_ip) { g_err = "NO PUDE OBTENER TU IP PUBLICA"; return 0; }
+    if (up.public_ip && up.public_ip != ip) {
+        mism = 1;
+        logf_("AVISO: la IP del router (%u.%u.%u.%u) es distinta de la que ve internet (%u.%u.%u.%u): "
+              "probable CGNAT o doble NAT, desde afuera no se llega al puerto", IP4(up.public_ip), IP4(ip));
+    }
+    code_encode(ip, g_cfg.port, code);
+    logf_("sala de 4 creada: ip=%u.%u.%u.%u puerto=%d codigo=%s", IP4(ip), g_cfg.port, code);
+
+    lfd = tcp_listen(g_cfg.port);
+    if (lfd < 0) { g_err = "NO PUDE ABRIR EL PUERTO"; return 0; }
+
+    snprintf(l2, sizeof l2, "PUERTO TCP %d", g_cfg.port);
+    col3 = 0xFFFFC040;
+    if (!g_cfg.upnp)                                   snprintf(l3, sizeof l3, "UPNP APAGADO: ABRE EL PUERTO");
+    else if (!up.router)                               snprintf(l3, sizeof l3, "SIN UPNP: ABRE EL PUERTO A MANO");
+    else if (up.public_ip && ip_privada(up.public_ip)) snprintf(l3, sizeof l3, "ROUTER SIN IP PUBLICA (CGNAT)");
+    else if (mism)                                     snprintf(l3, sizeof l3, "ROUTER E INTERNET: IP DISTINTA");
+    else if (up.opened)                              { snprintf(l3, sizeof l3, "UPNP: PUERTO ABIERTO"); col3 = 0xFF80FF80; }
+    else                                               snprintf(l3, sizeof l3, "UPNP RECHAZADO: ABRE EL PUERTO");
+    logf_("estado en pantalla: %s", l3);
+    g_stage = "esperando-amigo";
+    for (;;) {
+        uint16_t e;
+        pump();
+        if (!g_running) { closesocket(lfd); return 1; }
+        e = ui_edges();
+        if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
+        ui_clear();
+        ui_center(20, "NESNET V1.8", 2, 0xFFFFD040);
+        ui_center(64, "SALA DE 4 - TU CODIGO:", 1, 0xFFFFFFFF);
+        ui_center(84, code, 2, 0xFFFFFF40);
+        ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
+        ui_center(136, l2, 1, 0xFFC0C0FF);
+        ui_center(154, l3, 1, col3);
+        ui_center(176, "ESPERANDO AL AMIGO...", 1, 0xFFFFFFFF);
+        ui_center(200, "O: CANCELAR", 1, 0xFF8080A0);
+        present();
+        {
+            int r = fd_wait(lfd, POLLIN, 0);
+            if (r > 0) {
+                struct sockaddr_in pa;
+                socklen_t pl = sizeof pa;
+                int c;
+                memset(&pa, 0, sizeof pa);
+                c = accept(lfd, (struct sockaddr *)&pa, &pl);
+                if (c >= 0) {
+                    uint32_t pip = ntohl(pa.sin_addr.s_addr);
+                    logf_("conexion entrante de %u.%u.%u.%u", IP4(pip));
+                    g_net = c; sock_nodelay(c); break;
+                }
+                logf_("accept fallo (errno=%d)", errno);
+            }
+#ifdef NESNET_HOST
+            sleep_ms(16);
+#endif
+        }
+    }
+    closesocket(lfd);
+    ui_show("AMIGO CONECTADO", "MIDIENDO LATENCIA...", NULL);
+    if (!handshake_host4(&D)) { net_close(); return 0; }
+    return run_online4(1, D);
+}
+
+static int run_host4(void)
+{
+    int ok = run_host4_inner();
+    upnp_close();
+    return ok;
+}
+
+static int run_client4(void)
+{
+    char code[20];
+    uint32_t ip;
+    int port, D = 0;
+
+    if (g_cfg.code[0]) snprintf(code, sizeof code, "%s", g_cfg.code);
+    else if (!ui_enter_code(code)) { g_err = ""; return 1; }
+
+    if (!code_decode(code, &ip, &port)) { logf_("codigo escrito=%s: INVALIDO", code); g_err = "CODIGO INVALIDO"; return 0; }
+    logf_("codigo escrito=%s -> destino %u.%u.%u.%u:%d", code, IP4(ip), port);
+    net_ensure();
+    g_stage = "conectando";
+    {
+        char l2[48];
+        snprintf(l2, sizeof l2, "%u.%u.%u.%u:%d", IP4(ip), port);
+        ui_show("CONECTANDO...", l2, NULL);
+    }
+    g_net = tcp_connect(ip, port, 10000);
+    if (g_net < 0) {
+        g_err = g_conn_kind == 1 ? "SIN RESPUESTA DEL HOST (10 S)" : "EL HOST RECHAZO LA CONEXION";
+        return 0;
+    }
+    logf_("connect OK en %u ms", (unsigned)g_conn_ms);
+    ui_show("CONECTADO", "SINCRONIZANDO...", NULL);
+    if (!handshake_client4(&D)) { net_close(); return 0; }
+    return run_online4(0, D);
+}
+
 static int run_solo(void)
 {
     if (!core_load()) return 0;
@@ -2374,7 +2818,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("NesNet v1.7 - dir=%s", g_dir);
+    logf_("NesNet v1.8 - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
 }
@@ -2402,12 +2846,22 @@ static int app_main(const char *argv0)
             continue;
         }
         if (!g_rom) { choice = -1; continue; }             /* seguridad: sin ROM no se arranca nada */
+        if (choice == MODE_FOUR) {
+            /* v1.8: modo de 4 jugadores: submenu aparte con host y unirse (copias del 1vs1, otro protocolo) */
+            int sub = ui_menu4();
+            if (sub < 0) { choice = -1; continue; }         /* VOLVER / O: regresa al menu principal */
+            logf_("modo elegido: MULTIJUGADOR DE 4 - %s", sub == MODE_HOST ? "CREAR SALA (host, mandos 1-2)" : "UNIRSE (mandos 3-4)");
+            g_err = "";
+            ok = sub == MODE_HOST ? run_host4() : run_client4();
+            choice = -1;
+        } else {
         logf_("modo elegido: %s", choice == MODE_SOLO ? "SOLO (2 mandos)" : choice == MODE_HOST ? "CREAR SALA (host)" : "UNIRSE (cliente)");
         g_err = "";
         if (choice == MODE_SOLO) ok = run_solo();
         else if (choice == MODE_HOST) ok = run_host();
         else ok = run_client();
         choice = -1;
+        }
 #ifdef NESNET_HOST
         if (g_maxframes && !g_ui_has_script) g_running = 0;   /* pruebas: una sola sesion (con guion, sigue hasta que se agote) */
 #endif
@@ -2478,7 +2932,7 @@ int main(int argc, char **argv)
         static const char *items[3] = { "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS" };
         int i;
         ui_clear();
-        ui_center(20, "NESNET V1.7", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.8", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         for (i = 0; i < 3; i++) {
             char line[40];
@@ -2490,7 +2944,7 @@ int main(int argc, char **argv)
             char code[20];
             code_encode(((uint32_t)181 << 24) | (45u << 16) | (200u << 8) | 17u, 7777, code);
             ui_clear();
-            ui_center(20, "NESNET V1.7", 2, 0xFFFFD040);
+            ui_center(20, "NESNET V1.8", 2, 0xFFFFD040);
             ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
             ui_center(84, code, 2, 0xFFFFFF40);
             ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -2553,6 +3007,32 @@ int main(int argc, char **argv)
         if (g_net < 0) { fprintf(stderr, "no pude conectar\n"); return 2; }
         ok = handshake_client(&D);
         if (ok) ok = run_online(0, D);
+        if (!ok) fprintf(stderr, "ERROR: %s\n", g_err);
+    } else if (!strcmp(mode, "ref4")) {
+        /* v1.8: referencia de 4 jugadores locales con el mismo retraso D */
+        D = argc > 4 ? atoi(argv[4]) : 6;
+        g_four = 1;
+        core_load4(); session_loop4(-2, D, frames); core_unload();
+        g_four = 0;
+    } else if (!strcmp(mode, "host4")) {
+        int lfd = tcp_listen(port);
+        if (lfd < 0) { fprintf(stderr, "no puedo escuchar\n"); return 2; }
+        if (argc > 5) g_cfg.delay = atoi(argv[5]);
+        g_net = accept(lfd, NULL, NULL);
+        closesocket(lfd);
+        sock_nodelay(g_net);
+        ok = handshake_host4(&D);
+        if (ok) ok = run_online4(1, D);
+        if (!ok) fprintf(stderr, "ERROR: %s\n", g_err);
+    } else if (!strcmp(mode, "client4")) {
+        int tries;
+        for (tries = 0; tries < 50 && g_net < 0; tries++) {
+            g_net = tcp_connect(0x7F000001u, port, 2000);
+            if (g_net < 0) sleep_ms(100);
+        }
+        if (g_net < 0) { fprintf(stderr, "no pude conectar\n"); return 2; }
+        ok = handshake_client4(&D);
+        if (ok) ok = run_online4(0, D);
         if (!ok) fprintf(stderr, "ERROR: %s\n", g_err);
     } else if (!strcmp(mode, "reload")) {
         /* sesion solo, descarga, y luego sesion de referencia: debe dar igual que un proceso nuevo */
