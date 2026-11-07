@@ -470,8 +470,13 @@ static void au_push(const int16_t *d, size_t frames)
     }
     for (i = 0; i < frames; i++) {
         unsigned w = (g_aq_head + g_aq_cnt) % AU_QCAP;
-        g_aq[w * 2]     = d[i * 2];
-        g_aq[w * 2 + 1] = d[i * 2 + 1];
+        if (g_volume >= 100) {                      /* volumen normal: las muestras pasan sin tocarse (igual que antes) */
+            g_aq[w * 2]     = d[i * 2];
+            g_aq[w * 2 + 1] = d[i * 2 + 1];
+        } else {                                    /* v1.9: volumen bajado desde OPCIONES > SONIDO */
+            g_aq[w * 2]     = (int16_t)((int)d[i * 2]     * g_volume / 100);
+            g_aq[w * 2 + 1] = (int16_t)((int)d[i * 2 + 1] * g_volume / 100);
+        }
         g_aq_cnt++;
     }
 }
@@ -678,6 +683,9 @@ static int g_map[2][MA_COUNT] = {
 };
 static unsigned g_turbo_cnt[2][2];     /* cuadros seguidos que lleva apretado cada turbo (A, B) de cada mando */
 static int      g_screen;              /* 0 = original (pixeles cuadrados, como hasta ahora), 1 = 4:3 real, 2 = 16:9 estirada */
+static int      g_volume = 100;        /* v1.9: volumen 0..100 (100 = igual que siempre) */
+static int      g_netinfo;             /* v1.9: info de red en partida: 0 = solo al inicio (como siempre), 1 = siempre, 2 = no */
+static char     g_last_rom[ROM_NAMELEN];   /* v1.9: nombre del archivo de la ultima ROM elegida */
 
 static void map_defaults(int p)
 {
@@ -809,6 +817,9 @@ static void opts_defaults(void)
 {
     map_defaults(0); map_defaults(1);
     g_screen = 0;
+    g_volume = 100;
+    g_netinfo = 0;
+    g_last_rom[0] = 0;
 }
 
 static void opts_save(void)
@@ -822,6 +833,9 @@ static void opts_save(void)
     if (!f) { logf_("AVISO: no pude guardar opciones.txt"); return; }
     fprintf(f, "# NesNet - opciones (las cambia el menu OPCIONES)\n");
     fprintf(f, "screen=%d\n", g_screen);
+    fprintf(f, "volume=%d\n", g_volume);
+    fprintf(f, "netinfo=%d\n", g_netinfo);
+    if (g_last_rom[0]) fprintf(f, "rom=%s\n", g_last_rom);
     for (p = 0; p < 2; p++)
         fprintf(f, "pad%d=%d,%d,%d,%d,%d,%d\n", p + 1, g_map[p][0], g_map[p][1], g_map[p][2], g_map[p][3], g_map[p][4], g_map[p][5]);
     fclose(f);
@@ -842,6 +856,14 @@ static void opts_load(void)
         if (line[0] == '#') continue;
         if (sscanf(line, "screen=%d", &v[0]) == 1) {
             if (v[0] >= 0 && v[0] <= 2) g_screen = v[0];
+        } else if (sscanf(line, "volume=%d", &v[0]) == 1) {
+            if (v[0] >= 0 && v[0] <= 100) g_volume = v[0];
+        } else if (sscanf(line, "netinfo=%d", &v[0]) == 1) {
+            if (v[0] >= 0 && v[0] <= 2) g_netinfo = v[0];
+        } else if (!strncmp(line, "rom=", 4)) {
+            size_t n = strlen(line + 4);
+            while (n > 0 && (line[4 + n - 1] == '\n' || line[4 + n - 1] == '\r')) n--;
+            if (n > 0 && n < ROM_NAMELEN && !memchr(line + 4, '/', n) && line[4] != '.') { memcpy(g_last_rom, line + 4, n); g_last_rom[n] = 0; }
         } else if ((line[0] == 'p' && line[1] == 'a' && line[2] == 'd' && (line[3] == '1' || line[3] == '2') && line[4] == '=') &&
                    sscanf(line + 5, "%d,%d,%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) {
             p = line[3] - '1';
@@ -850,9 +872,10 @@ static void opts_load(void)
         }
     }
     fclose(f);
-    logf_("opciones: pantalla=%d  mando1=%d,%d,%d,%d,%d,%d  mando2=%d,%d,%d,%d,%d,%d", g_screen,
+    logf_("opciones: pantalla=%d volumen=%d info_red=%d  mando1=%d,%d,%d,%d,%d,%d  mando2=%d,%d,%d,%d,%d,%d", g_screen, g_volume, g_netinfo,
           g_map[0][0], g_map[0][1], g_map[0][2], g_map[0][3], g_map[0][4], g_map[0][5],
           g_map[1][0], g_map[1][1], g_map[1][2], g_map[1][3], g_map[1][4], g_map[1][5]);
+    if (g_last_rom[0]) logf_("opciones: ultima ROM = %s", g_last_rom);
 }
 
 #ifdef NESNET_PS3
@@ -1527,6 +1550,90 @@ static int core_load4(void)
 static void core_unload(void)
 {
     if (g_core_loaded) { retro_unload_game(); g_core_loaded = 0; }
+}
+
+/* ------------------------------------------------------------------ */
+/* v1.9: guardado de bateria (SRAM) - SOLO en el modo SOLO              */
+/* Archivo: USRDIR/saves/<CRC32 de la ROM>.srm (asi renombrar la ROM no pierde el guardado).                      */
+/* En online NO se carga ni se guarda nada: las dos consolas tienen que empezar con la misma memoria, si no se       */
+/* desincronizan, y ademas una partida online no debe pisar tu guardado.                                          */
+/* ------------------------------------------------------------------ */
+#define SRAM_MAX 0x20000
+static uint8_t g_sram_last[SRAM_MAX];     /* lo ultimo escrito en disco (para guardar solo si cambio) */
+static size_t  g_sram_lastsz;
+static int     g_sram_on;                 /* 1 = esta partida guarda (solo SOLO, y solo si el juego tiene bateria) */
+
+static void sram_path(char *out, size_t cap)
+{
+    snprintf(out, cap, "%s/saves/%08X.srm", g_dir, (unsigned)g_romcrc);
+}
+
+static uint8_t *sram_ptr(size_t *sz)
+{
+    void *p = retro_get_memory_data(RETRO_MEMORY_SAVE_RAM);
+    size_t n = retro_get_memory_size(RETRO_MEMORY_SAVE_RAM);
+    if (!p || n == 0 || n > SRAM_MAX) return NULL;
+    *sz = n;
+    return (uint8_t *)p;
+}
+
+/* Llamar justo despues de core_load() en el modo SOLO: carga el guardado si existe */
+static void sram_begin(void)
+{
+    size_t n = 0, fsz = 0;
+    uint8_t *p, *buf = NULL;
+    char path[420], tmp[440];
+    int got;
+    g_sram_on = 0; g_sram_lastsz = 0;
+    p = sram_ptr(&n);
+    if (!p) { logf_("guardado: este juego no usa memoria de bateria"); return; }
+    g_sram_on = 1;
+    sram_path(path, sizeof path);
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    got = read_whole_file(path, &buf, &fsz);
+    if (!got) got = read_whole_file(tmp, &buf, &fsz);          /* si se corto la luz justo al guardar, queda el .tmp completo */
+    if (got) {
+        if (fsz == n) { memcpy(p, buf, n); logf_("guardado: cargado %s (%u bytes)", path, (unsigned)n); }
+        else {
+            char old[450];
+            snprintf(old, sizeof old, "%s.old", path);
+            remove(old);
+            rename(path, old);                                   /* no lo borro: queda como .old */
+            logf_("AVISO: el guardado tenia %u bytes y el juego pide %u: lo movi a .old y empiezo de cero", (unsigned)fsz, (unsigned)n);
+        }
+        free(buf);
+    } else {
+        logf_("guardado: partida nueva (aun no hay %s)", path);
+    }
+    memcpy(g_sram_last, p, n);
+    g_sram_lastsz = n;
+}
+
+/* Escribe el guardado si cambio desde la ultima vez (force = siempre). */
+static void sram_save(int force)
+{
+    size_t n = 0;
+    uint8_t *p;
+    char dir[320], path[420], tmp[440];
+    FILE *f;
+    int ok;
+    if (!g_sram_on) return;
+    p = sram_ptr(&n);
+    if (!p || n != g_sram_lastsz) return;
+    if (!force && !memcmp(p, g_sram_last, n)) return;
+    snprintf(dir, sizeof dir, "%s/saves", g_dir);
+    mkdir(dir, 0777);
+    sram_path(path, sizeof path);
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    f = fopen(tmp, "wb");
+    if (!f) { logf_("AVISO: no pude crear %s (errno=%d)", tmp, errno); return; }
+    ok = fwrite(p, 1, n, f) == n;
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) { logf_("AVISO: no pude escribir el guardado"); remove(tmp); return; }
+    remove(path);
+    if (rename(tmp, path) != 0) { logf_("AVISO: no pude renombrar el guardado (queda %s)", tmp); return; }
+    memcpy(g_sram_last, p, n);
+    logf_("guardado: escrito %s (%u bytes)", path, (unsigned)n);
 }
 
 static void step_frame(uint16_t p1, uint16_t p2)
@@ -2233,6 +2340,54 @@ static int exit_menu(int online)
     return r == 1;
 }
 
+/* v1.9: menu de R2 SOLO para el modo SOLO: CONTINUAR / REINICIAR / SALIR (reiniciar y salir piden confirmar con X).
+ * En online se sigue usando exit_menu() de arriba, sin cambios. Devuelve 0 = seguir jugando, 1 = salir, 2 = reiniciar el juego. */
+static int solo_menu(void)
+{
+    static const char *items[3] = { "CONTINUAR", "REINICIAR EL JUEGO", "SALIR DE LA PARTIDA" };
+    int sel = 0, r = -1, confirm = 0, x, y, i;
+    memcpy(g_fb_save, g_fb, sizeof g_fb);
+    g_stage = "menu-solo";
+    ui_prime();
+    while (g_running && r < 0) {
+        uint16_t e;
+        pump();
+        e = ui_edges();
+        if (confirm) {
+            if (e & UI_OK) r = confirm == 1 ? 2 : 1;
+            else if (e & UI_CANCEL) confirm = 0;
+        } else {
+            if (e & UI_UP)   sel = (sel + 2) % 3;
+            if (e & UI_DOWN) sel = (sel + 1) % 3;
+            if (e & UI_CANCEL) r = 0;
+            else if (e & (UI_OK | UI_START)) { if (sel == 0) r = 0; else confirm = sel; }
+        }
+        for (y = 62; y < 178; y++)
+            for (x = 20; x < 236; x++)
+                g_fb[y * SCR_W + x] = (y < 64 || y >= 176 || x < 22 || x >= 234) ? 0xFFFFFFFF : 0xFF101838;
+        if (confirm) {
+            ui_center(94, confirm == 1 ? "REINICIAR EL JUEGO?" : "SALIR DE LA PARTIDA?", 1, 0xFFFFFFFF);
+            ui_center(120, "X: SI      O: NO", 1, 0xFFFFD040);
+            if (confirm == 1) ui_center(142, "LO GUARDADO NO SE BORRA", 1, 0xFFC0C0FF);
+        } else {
+            ui_center(72, "MENU", 1, 0xFFFFD040);
+            for (i = 0; i < 3; i++) {
+                char l[40];
+                snprintf(l, sizeof l, "%s %s", i == sel ? ">" : " ", items[i]);
+                ui_center(96 + i * 16, l, 1, i == sel ? 0xFFFFFFFF : 0xFF8080A0);
+            }
+            ui_center(154, "ARRIBA/ABAJO + X   O: SEGUIR", 1, 0xFF8080A0);
+        }
+        present();
+#ifdef NESNET_HOST
+        sleep_ms(16);
+#endif
+    }
+    memcpy(g_fb, g_fb_save, sizeof g_fb);
+    g_stage = "juego";
+    return r < 0 ? 0 : r;
+}
+
 /* role: 0 = host (P1), 1 = cliente (P2), -1 = local directo (2 mandos),
  *       -2 = referencia de pruebas: local con el mismo retraso D     */
 static int session_loop(int role, int D, uint32_t maxframes)
@@ -2267,7 +2422,10 @@ static int session_loop(int role, int D, uint32_t maxframes)
         /* v1.7: R2 abre el menu de salir. Se mira antes de mandar la entrada de este frame; si sigue, el
          * otro lado simplemente espera como siempre. No cambia nada del protocolo ni del lockstep. */
         if (role != -2 && exit_pressed(0, frame)) {
-            if (exit_menu(role >= 0)) { user_exit = 1; logf_("salida pedida por el jugador (R2) en frame %u", (unsigned)frame); goto out; }
+            /* v1.9: en SOLO (role -1) el menu es CONTINUAR / REINICIAR / SALIR; en online (role >= 0) es el de siempre */
+            int xr = role == -1 ? solo_menu() : (exit_menu(role >= 0) ? 1 : 0);
+            if (xr == 1) { user_exit = 1; logf_("salida pedida por el jugador (R2) en frame %u", (unsigned)frame); goto out; }
+            if (xr == 2) { retro_reset(); logf_("juego reiniciado por el jugador (R2) en frame %u", (unsigned)frame); }
             last_rx = now_ms();
         }
 
@@ -2340,6 +2498,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
         present();
         frame++;
         g_frames_done = frame;
+        if (role == -1 && (frame % 300) == 0) sram_save(0);      /* v1.9: guardado de bateria cada ~5 s si cambio (solo SOLO) */
     }
 out:
     if (role >= 0 && g_net >= 0) {
@@ -3161,7 +3320,10 @@ static int run_client4(void)
 static int run_solo(void)
 {
     if (!core_load()) return 0;
+    sram_begin();                         /* v1.9: carga el guardado de bateria (si el juego lo usa) */
     session_loop(-1, 0, g_maxframes);
+    sram_save(0);                         /* v1.9: guarda al salir (si cambio) */
+    g_sram_on = 0;
     core_unload();
     return 1;
 }
