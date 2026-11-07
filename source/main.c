@@ -76,6 +76,7 @@ int closesocket(int s);      /* definida en libnet, pero sin prototipo en las ca
 #define MODE_JOIN      2
 #define MODE_ROM       3      /* v1.7: opcion "ELEGIR ROM" del menu (no es un modo de juego) */
 #define MODE_FOUR      4      /* v1.8: opcion "MULTIJUGADOR DE 4" (submenu con host y unirse) */
+#define MODE_OPT       5      /* v1.8.2: opcion "OPCIONES" del menu (pantalla y mandos; no es un modo de juego) */
 
 /* v1.8: el modo de 4 jugadores es una COPIA aparte del 1vs1 y habla otro protocolo, asi un host de 1vs1
  * nunca acepta a alguien del modo de 4 (ni al reves). El 1vs1 sigue con PROTO_VER 1, igual que la v1.7. */
@@ -655,6 +656,205 @@ static uint16_t stick_nes_bits(unsigned h, unsigned v)
     return b;
 }
 
+/* ------------------------------------------------------------------ */
+/* v1.8.2: OPCIONES - mapeo de botones, turbo y pantalla               */
+/* Todo esto es LOCAL. Por la red sigue viajando el estado de los botones del NES (el mensaje no cambia),   */
+/* asi que el mapeo de cada jugador no hace falta enviarlo: cada consola traduce sus propios botones antes. */
+/* Las funciones de esta seccion son puras (no tocan la PS3), asi que se prueban tal cual en PC.             */
+/* ------------------------------------------------------------------ */
+enum { PB_CROSS, PB_CIRCLE, PB_SQUARE, PB_TRIANGLE, PB_L1, PB_R1, PB_L2, PB_R2, PB_L3, PB_R3, PB_START, PB_SELECT, PB_COUNT };
+#define PB_NONE   (-1)
+#define PB_BIT(b) (1u << (b))
+enum { MA_A, MA_B, MA_SEL, MA_START, MA_TA, MA_TB, MA_COUNT };    /* MA_TA / MA_TB = turbo A / turbo B */
+
+static const char *const pb_names[PB_COUNT] = { "X", "O", "CUADRADO", "TRIANGULO", "L1", "R1", "L2", "R2", "L3", "R3", "START", "SELECT" };
+static const char *const ma_names[MA_COUNT] = { "A", "B", "SELECT", "START", "TURBO A", "TURBO B" };
+
+/* boton de la PS3 que dispara cada boton del NES, por mando. Los valores por defecto son EXACTAMENTE los de la v1.8.1
+ * (O = A, X = B, SELECT, START); los turbo empiezan sin asignar. Las direcciones (cruz y palanca) no se remapean. */
+static int g_map[2][MA_COUNT] = {
+    { PB_CIRCLE, PB_CROSS, PB_SELECT, PB_START, PB_NONE, PB_NONE },
+    { PB_CIRCLE, PB_CROSS, PB_SELECT, PB_START, PB_NONE, PB_NONE }
+};
+static unsigned g_turbo_cnt[2][2];     /* cuadros seguidos que lleva apretado cada turbo (A, B) de cada mando */
+static int      g_screen;              /* 0 = original (pixeles cuadrados, como hasta ahora), 1 = 4:3 real, 2 = 16:9 estirada */
+
+static void map_defaults(int p)
+{
+    g_map[p][MA_A] = PB_CIRCLE; g_map[p][MA_B] = PB_CROSS;
+    g_map[p][MA_SEL] = PB_SELECT; g_map[p][MA_START] = PB_START;
+    g_map[p][MA_TA] = PB_NONE; g_map[p][MA_TB] = PB_NONE;
+    g_turbo_cnt[p][0] = g_turbo_cnt[p][1] = 0;
+}
+
+/* Convierte los botones de PS3 apretados (mascara PB_BIT) y las direcciones ya calculadas (cruz + palanca) en el byte NES.
+ * Turbo: mientras el boton esta apretado alterna 2 cuadros apretado / 2 sueltos (15 pulsos por segundo), empezando apretado. */
+static uint16_t map_nes_bits(int port, uint32_t btns, uint16_t dirs)
+{
+    const int *m = g_map[port & 1];
+    uint16_t b = (uint16_t)(dirs & (NB_UP | NB_DOWN | NB_LEFT | NB_RIGHT));
+    int t;
+    if (m[MA_A]     >= 0 && (btns & PB_BIT(m[MA_A])))     b |= NB_A;
+    if (m[MA_B]     >= 0 && (btns & PB_BIT(m[MA_B])))     b |= NB_B;
+    if (m[MA_SEL]   >= 0 && (btns & PB_BIT(m[MA_SEL])))   b |= NB_SEL;
+    if (m[MA_START] >= 0 && (btns & PB_BIT(m[MA_START]))) b |= NB_START;
+    for (t = 0; t < 2; t++) {
+        int id = m[MA_TA + t];
+        unsigned *c = &g_turbo_cnt[port & 1][t];
+        if (id >= 0 && (btns & PB_BIT(id))) {
+            if (((*c >> 1) & 1u) == 0) b |= (t == 0 ? NB_A : NB_B);
+            *c = (*c + 1) & 0xFFFFu;
+        } else {
+            *c = 0;
+        }
+    }
+    if ((b & NB_UP) && (b & NB_DOWN))    b &= (uint16_t)~NB_DOWN;
+    if ((b & NB_LEFT) && (b & NB_RIGHT)) b &= (uint16_t)~NB_RIGHT;
+    return b;
+}
+
+/* ¿Puede la accion 'act' del mando 'port' tomar el boton 'btn'? Reglas: solo los turbo pueden quedar sin boton;
+ * R2 del mando 1 esta reservado (abre el menu de salir); un boton que ya usa OTRA fila del mismo mando no se puede tomar
+ * (nunca se mueve un boton ajeno: para cambiarlo, primero se libera en su fila). */
+static int map_allowed(int port, int act, int btn)
+{
+    int a;
+    if (btn == PB_NONE) return act >= MA_TA;
+    if (btn < 0 || btn >= PB_COUNT) return 0;
+    if (port == 0 && btn == PB_R2) return 0;
+    for (a = 0; a < MA_COUNT; a++)
+        if (a != act && g_map[port][a] == btn) return 0;
+    return 1;
+}
+
+static void map_assign(int port, int act, int btn) { g_map[port][act] = btn; }
+
+/* Pasa al siguiente (dir = +1) o anterior (dir = -1) boton permitido, saltando los que no se pueden tomar.
+ * Orden: SIN ASIGNAR (solo turbo), X, O, CUADRADO, TRIANGULO, L1, R1, L2, R2, L3, R3, START, SELECT */
+static void map_cycle(int port, int act, int dir)
+{
+    int n = PB_COUNT + 1, cur = g_map[port][act] + 1, i;
+    for (i = 1; i <= n; i++) {
+        int idx = (((cur + dir * i) % n) + n) % n;
+        int btn = idx - 1;
+        if (map_allowed(port, act, btn)) { map_assign(port, act, btn); return; }
+    }
+}
+
+/* Comprueba un mapeo leido de archivo: botones normales siempre asignados, sin repetidos, sin R2 en el mando 1 */
+static int map_valid(const int *m, int port)
+{
+    int a, c;
+    for (a = 0; a < MA_COUNT; a++) {
+        if (m[a] == PB_NONE) { if (a < MA_TA) return 0; continue; }
+        if (m[a] < 0 || m[a] >= PB_COUNT) return 0;
+        if (port == 0 && m[a] == PB_R2) return 0;
+        for (c = a + 1; c < MA_COUNT; c++) if (m[c] == m[a]) return 0;
+    }
+    return 1;
+}
+
+/* Pantalla: ancho de salida (en pixeles de la TV) para un alto de salida 'oh'.
+ *   0 original  = SCR_W * z  (pixeles cuadrados, 768x720 en 720p: lo de siempre)
+ *   1 4:3 real  = oh * 4 / 3 (960x720 en 720p: columnas repetidas 3 o 4 veces, el 3,75 no es entero)
+ *   2 16:9      = oh * 16 / 9 (1280x720 en 720p: cada columna x5 y cada fila x3, todo entero) */
+#define COLMAP_MAX 2048
+static const char *const screen_names[3] = { "ORIGINAL", "4:3 REAL", "16:9 ESTIRADA" };
+static int screen_out_w(int mode, int dw, int oh, int z)
+{
+    int w;
+    if (mode == 1) w = oh * 4 / 3;
+    else if (mode == 2) w = oh * 16 / 9;
+    else w = SCR_W * z;
+    if (w > dw) w = dw;
+    if (w > COLMAP_MAX) w = COLMAP_MAX;
+    return w;
+}
+
+/* Dibuja el lienzo 256x240 en el buffer de pantalla 'base' (dw x dh, ARGB) centrado, escalado segun 'mode' (vertical entero z).
+ * Cada 4 cuadros, DE CADA BUFFER, borra lo que queda fuera de la imagen (residuo del XMB / modo anterior); la imagen se repinta siempre.
+ * fcnt = contador de cuadros de ese buffer. Version unica para la PS3 y para las pruebas de PC. */
+static void canvas_blit_cpu(uint32_t *base, int dw, int dh, int mode, int z, const uint32_t *fb, unsigned *fcnt)
+{
+    static uint32_t row[COLMAP_MAX];
+    static int cm[COLMAP_MAX];
+    static int l_ow = -1;
+    int oh = SCR_H * z, ow = screen_out_w(mode, dw, oh, z);
+    int ox = (dw - ow) / 2, oy = (dh - oh) / 2, x, y, k;
+    uint32_t *dst;
+    if (z < 1 || ow < 1 || ox < 0 || oy < 0 || oy + oh > dh) return;
+    if (ow != l_ow) { for (x = 0; x < ow; x++) cm[x] = x * SCR_W / ow; l_ow = ow; }
+    if (((*fcnt)++ & 3) == 0) {
+        int below = dh - oy - oh;
+        if (oy > 0) memset(base, 0, (size_t)oy * dw * 4);
+        if (below > 0) memset(base + (size_t)(oy + oh) * dw, 0, (size_t)below * dw * 4);
+        if (ox > 0) {
+            int right = dw - ox - ow;
+            for (y = oy; y < oy + oh; y++) {
+                memset(base + (size_t)y * dw, 0, (size_t)ox * 4);
+                if (right > 0) memset(base + (size_t)y * dw + ox + ow, 0, (size_t)right * 4);
+            }
+        }
+    }
+    dst = base + (size_t)oy * dw + ox;
+    for (y = 0; y < SCR_H; y++) {
+        const uint32_t *src = fb + y * SCR_W;
+        for (x = 0; x < ow; x++) row[x] = src[cm[x]];
+        for (k = 0; k < z; k++) { memcpy(dst, row, (size_t)ow * 4); dst += dw; }
+    }
+}
+
+/* Guardado de las opciones: USRDIR/opciones.txt (aparte de config.txt, que el instalador puede reemplazar) */
+static void opts_defaults(void)
+{
+    map_defaults(0); map_defaults(1);
+    g_screen = 0;
+}
+
+static void opts_save(void)
+{
+    char path[300], tmp[300];
+    FILE *f;
+    int p;
+    snprintf(path, sizeof path, "%s/opciones.txt", g_dir);
+    snprintf(tmp, sizeof tmp, "%s/opciones.tmp", g_dir);
+    f = fopen(tmp, "w");
+    if (!f) { logf_("AVISO: no pude guardar opciones.txt"); return; }
+    fprintf(f, "# NesNet - opciones (las cambia el menu OPCIONES)\n");
+    fprintf(f, "screen=%d\n", g_screen);
+    for (p = 0; p < 2; p++)
+        fprintf(f, "pad%d=%d,%d,%d,%d,%d,%d\n", p + 1, g_map[p][0], g_map[p][1], g_map[p][2], g_map[p][3], g_map[p][4], g_map[p][5]);
+    fclose(f);
+    remove(path);
+    if (rename(tmp, path) != 0) logf_("AVISO: no pude renombrar opciones.tmp");
+}
+
+static void opts_load(void)
+{
+    char path[300], line[200];
+    FILE *f;
+    opts_defaults();
+    snprintf(path, sizeof path, "%s/opciones.txt", g_dir);
+    f = fopen(path, "r");
+    if (!f) { logf_("sin opciones.txt: pantalla y mandos por defecto"); return; }
+    while (fgets(line, sizeof line, f)) {
+        int v[MA_COUNT], p;
+        if (line[0] == '#') continue;
+        if (sscanf(line, "screen=%d", &v[0]) == 1) {
+            if (v[0] >= 0 && v[0] <= 2) g_screen = v[0];
+        } else if ((line[0] == 'p' && line[1] == 'a' && line[2] == 'd' && (line[3] == '1' || line[3] == '2') && line[4] == '=') &&
+                   sscanf(line + 5, "%d,%d,%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) {
+            p = line[3] - '1';
+            if (map_valid(v, p)) { int a; for (a = 0; a < MA_COUNT; a++) g_map[p][a] = v[a]; }
+            else logf_("AVISO: opciones.txt: mapeo del mando %d no valido, uso el de por defecto", p + 1);
+        }
+    }
+    fclose(f);
+    logf_("opciones: pantalla=%d  mando1=%d,%d,%d,%d,%d,%d  mando2=%d,%d,%d,%d,%d,%d", g_screen,
+          g_map[0][0], g_map[0][1], g_map[0][2], g_map[0][3], g_map[0][4], g_map[0][5],
+          g_map[1][0], g_map[1][1], g_map[1][2], g_map[1][3], g_map[1][4], g_map[1][5]);
+}
+
 #ifdef NESNET_PS3
 
 #define CB_SIZE   0x100000
@@ -828,36 +1028,16 @@ static void gpu_blit_canvas(void)
 
     if (g_cfg.render) {
         /* Modo CPU: sin transferencia ni clear ni blend de la GPU; escribo directo en el buffer de pantalla */
-        static u32 row[SCR_W * 4];
         static unsigned cpu_frame[2];     /* un contador por buffer de pantalla (v1.4) */
-        int z = g_zoom, x, y, k;
-        int ox = (int)(g_dw - SCR_W * z) / 2, oy = (int)(g_dh - SCR_H * z) / 2;
-        u32 *dst = g_cbuf[g_cur] + oy * g_dw + ox;
         if (!g_first) {
             int guard = 0;
             while (gcmGetFlipStatus() != 0 && guard++ < 15000) usleep(200);
         }
         g_stage = "cpu-copia";
-        /* v1.3: limpia cada 4 cuadros DE CADA BUFFER lo que queda fuera del juego (bordes) para que no se quede el
-         * residuo del XMB (reloj / bateria del mando); el juego mismo se repinta siempre. */
-        if ((cpu_frame[g_cur & 1]++ & 3) == 0) {
-            u32 *base = g_cbuf[g_cur];
-            int below = (int)g_dh - oy - SCR_H * z;
-            if (oy > 0) memset(base, 0, (size_t)oy * g_dw * 4);
-            if (below > 0) memset(base + (size_t)(oy + SCR_H * z) * g_dw, 0, (size_t)below * g_dw * 4);
-            if (ox > 0) {
-                int right = (int)g_dw - ox - SCR_W * z;
-                for (y = oy; y < oy + SCR_H * z; y++) {
-                    memset(base + (size_t)y * g_dw, 0, (size_t)ox * 4);
-                    if (right > 0) memset(base + (size_t)y * g_dw + ox + SCR_W * z, 0, (size_t)right * 4);
-                }
-            }
-        }
-        for (y = 0; y < SCR_H; y++) {
-            const u32 *src = g_fb + y * SCR_W;
-            for (x = 0; x < SCR_W; x++) for (k = 0; k < z; k++) row[x * z + k] = src[x];
-            for (k = 0; k < z; k++) { memcpy(dst, row, SCR_W * z * 4); dst += g_dw; }
-        }
+        /* v1.3: cada 4 cuadros DE CADA BUFFER se limpia lo que queda fuera del juego (bordes) para que no se quede el
+         * residuo del XMB (reloj / bateria del mando); el juego mismo se repinta siempre.
+         * v1.8.2: el escalado (modo de pantalla elegido en OPCIONES) y esa limpieza viven en canvas_blit_cpu. */
+        canvas_blit_cpu((uint32_t *)g_cbuf[g_cur], (int)g_dw, (int)g_dh, g_screen, g_zoom, (const uint32_t *)g_fb, &cpu_frame[g_cur & 1]);
         return;
     }
 
@@ -971,22 +1151,35 @@ static padData *pad_read(int port)
     return &g_pd[port];
 }
 
+/* v1.8.2: botones de la PS3 apretados, como mascara PB_BIT (los que se pueden asignar en OPCIONES) */
+static uint32_t pad_buttons(const padData *d)
+{
+    uint32_t m = 0;
+    if (d->BTN_CROSS)    m |= PB_BIT(PB_CROSS);
+    if (d->BTN_CIRCLE)   m |= PB_BIT(PB_CIRCLE);
+    if (d->BTN_SQUARE)   m |= PB_BIT(PB_SQUARE);
+    if (d->BTN_TRIANGLE) m |= PB_BIT(PB_TRIANGLE);
+    if (d->BTN_L1)       m |= PB_BIT(PB_L1);
+    if (d->BTN_R1)       m |= PB_BIT(PB_R1);
+    if (d->BTN_L2)       m |= PB_BIT(PB_L2);
+    if (d->BTN_R2)       m |= PB_BIT(PB_R2);
+    if (d->BTN_L3)       m |= PB_BIT(PB_L3);
+    if (d->BTN_R3)       m |= PB_BIT(PB_R3);
+    if (d->BTN_START)    m |= PB_BIT(PB_START);
+    if (d->BTN_SELECT)   m |= PB_BIT(PB_SELECT);
+    return m;
+}
+
 static uint16_t pad_nes_bits(int port)
 {
     padData *d = pad_read(port);
-    uint16_t b = 0;
-    if (d->BTN_CIRCLE) b |= NB_A;
-    if (d->BTN_CROSS)  b |= NB_B;
-    if (d->BTN_SELECT) b |= NB_SEL;
-    if (d->BTN_START)  b |= NB_START;
-    if (d->BTN_UP)     b |= NB_UP;
-    if (d->BTN_DOWN)   b |= NB_DOWN;
-    if (d->BTN_LEFT)   b |= NB_LEFT;
-    if (d->BTN_RIGHT)  b |= NB_RIGHT;
-    b |= stick_nes_bits(d->ANA_L_H, d->ANA_L_V);          /* v1.8.1: palanca izquierda = cruz */
-    if ((b & NB_UP) && (b & NB_DOWN))   b &= ~NB_DOWN;
-    if ((b & NB_LEFT) && (b & NB_RIGHT)) b &= ~NB_RIGHT;
-    return b;
+    uint16_t dirs = 0;
+    if (d->BTN_UP)     dirs |= NB_UP;
+    if (d->BTN_DOWN)   dirs |= NB_DOWN;
+    if (d->BTN_LEFT)   dirs |= NB_LEFT;
+    if (d->BTN_RIGHT)  dirs |= NB_RIGHT;
+    dirs |= stick_nes_bits(d->ANA_L_H, d->ANA_L_V);       /* v1.8.1: palanca izquierda = cruz */
+    return map_nes_bits(port, pad_buttons(d), dirs);      /* v1.8.2: botones segun OPCIONES > MANDOS (por defecto, igual que antes) */
 }
 
 static uint16_t ui_edges(void)
@@ -2318,7 +2511,7 @@ out:
 static void ui_show(const char *l1, const char *l2, const char *l3)
 {
     ui_clear();
-    ui_center(20, "NESNET V1.8.1", 2, 0xFFFFD040);
+    ui_center(20, "NESNET V1.8.2", 2, 0xFFFFD040);
     if (l1) ui_center(90, l1, 1, 0xFFFFFFFF);
     if (l2) ui_center(110, l2, 1, 0xFFC0C0FF);
     if (l3) ui_center(130, l3, 1, 0xFFC0C0FF);
@@ -2407,10 +2600,159 @@ static int ui_rom_select(void)
     return 0;
 }
 
+/* v1.8.2: OPCIONES > PANTALLA. El modo se aplica en el acto al mover el cursor (esta misma pantalla ya sale con el modo elegido) */
+static void ui_opt_screen(void)
+{
+    static const char *desc[3] = { "PIXELES CUADRADOS (COMO SIEMPRE)", "PROPORCION DE TV 4:3", "ESTIRADA A PANTALLA ANCHA 16:9" };
+    int i;
+    g_stage = "opciones-pantalla";
+    ui_prime();
+    while (g_running) {
+        uint16_t e;
+        pump();
+        e = ui_edges();
+        if (e & UI_UP)   { g_screen = (g_screen + 2) % 3; opts_save(); }
+        if (e & UI_DOWN) { g_screen = (g_screen + 1) % 3; opts_save(); }
+        if (e & (UI_OK | UI_CANCEL | UI_START)) break;
+        ui_clear();
+        ui_center(20, "PANTALLA", 2, 0xFFFFD040);
+        ui_center(46, "LA IMAGEN CAMBIA AL MOVER EL CURSOR", 1, 0xFFC0C0FF);
+        for (i = 0; i < 3; i++) {
+            char line[48];
+            snprintf(line, sizeof line, "%s %s", i == g_screen ? ">" : " ", screen_names[i]);
+            ui_center(78 + i * 22, line, 1, i == g_screen ? 0xFFFFFFFF : 0xFF8080A0);
+        }
+        ui_center(150, desc[g_screen], 1, 0xFF80FF80);
+        if (!g_cfg.render) ui_center(170, "AVISO: EL MODO GPU NO USA ESTO", 1, 0xFFFFC040);
+        ui_center(200, "ARRIBA/ABAJO: ELEGIR", 1, 0xFF8080A0);
+        ui_center(214, "X / O: VOLVER", 1, 0xFF8080A0);
+        present();
+#ifdef NESNET_HOST
+        sleep_ms(16);
+#endif
+    }
+    logf_("opciones: pantalla = %s", screen_names[g_screen]);
+}
+
+/* v1.8.2: OPCIONES > MANDOS > MANDO n: un boton de la PS3 por cada boton del NES, y turbo A / turbo B.
+ * IZQ/DER cambia el boton de la fila marcada y SALTA los que ya usa otra fila (no mueve botones ajenos). */
+static void ui_opt_pad(int port)
+{
+    int sel = 0, i;          /* filas 0..5 = acciones, 6 = RESTAURAR ESTE MANDO, 7 = VOLVER */
+    g_stage = "opciones-mando";
+    ui_prime();
+    while (g_running) {
+        uint16_t e;
+        char title[16];
+        pump();
+        e = ui_edges();
+        if (e & UI_UP)   sel = (sel + 7) % 8;
+        if (e & UI_DOWN) sel = (sel + 1) % 8;
+        if (e & UI_CANCEL) break;
+        if (sel < MA_COUNT) {
+            if (e & UI_LEFT)            { map_cycle(port, sel, -1); opts_save(); }
+            if (e & (UI_RIGHT | UI_OK)) { map_cycle(port, sel, +1); opts_save(); }
+        } else if (e & (UI_OK | UI_START)) {
+            if (sel == 6) { map_defaults(port); opts_save(); }
+            else break;
+        }
+        ui_clear();
+        snprintf(title, sizeof title, "MANDO %d", port + 1);
+        ui_center(14, title, 2, 0xFFFFD040);
+        for (i = 0; i < 8; i++) {
+            char line[56];
+            uint32_t col = i == sel ? 0xFFFFFFFF : 0xFF8080A0;
+            if (i < MA_COUNT)
+                snprintf(line, sizeof line, "%s %-8s %s", i == sel ? ">" : " ", ma_names[i], g_map[port][i] == PB_NONE ? "NO" : pb_names[g_map[port][i]]);
+            else
+                snprintf(line, sizeof line, "%s %s", i == sel ? ">" : " ", i == 6 ? "RESTAURAR ESTE MANDO" : "VOLVER");
+            ui_text(40, 44 + i * 16, line, 1, col);
+        }
+        ui_center(176, "IZQ/DER: CAMBIAR (SALTA LOS USADOS)", 1, 0xFFC0C0FF);
+        ui_center(190, "TURBO: 15 PULSOS POR SEGUNDO", 1, 0xFFC0C0FF);
+        if (port == 0) ui_center(204, "R2 DEL MANDO 1 ES PARA SALIR", 1, 0xFFFFC040);
+        ui_center(218, "O: VOLVER", 1, 0xFF8080A0);
+        present();
+#ifdef NESNET_HOST
+        sleep_ms(16);
+#endif
+    }
+}
+
+static void ui_opt_pads(void)
+{
+    static const char *items[4] = { "MANDO 1", "MANDO 2", "RESTAURAR LOS DOS", "VOLVER" };
+    int sel = 0, i;
+    g_stage = "opciones-mandos";
+    ui_prime();
+    while (g_running) {
+        uint16_t e;
+        pump();
+        e = ui_edges();
+        if (e & UI_UP)   sel = (sel + 3) % 4;
+        if (e & UI_DOWN) sel = (sel + 1) % 4;
+        if (e & UI_CANCEL) break;
+        if (e & (UI_OK | UI_START)) {
+            if (sel < 2) { ui_opt_pad(sel); ui_prime(); g_stage = "opciones-mandos"; }
+            else if (sel == 2) { map_defaults(0); map_defaults(1); opts_save(); }
+            else break;
+        }
+        ui_clear();
+        ui_center(20, "MANDOS", 2, 0xFFFFD040);
+        ui_center(46, "BOTONES Y TURBO DE CADA MANDO", 1, 0xFFC0C0FF);
+        for (i = 0; i < 4; i++) {
+            char line[40];
+            snprintf(line, sizeof line, "%s %s", i == sel ? ">" : " ", items[i]);
+            ui_center(84 + i * 22, line, 1, i == sel ? 0xFFFFFFFF : 0xFF8080A0);
+        }
+        ui_center(190, "VALE PARA SOLO, 1 VS 1 Y 4 JUGADORES", 1, 0xFF8080A0);
+        ui_center(204, "ARRIBA/ABAJO + X", 1, 0xFF8080A0);
+        present();
+#ifdef NESNET_HOST
+        sleep_ms(16);
+#endif
+    }
+}
+
+static void ui_options(void)
+{
+    static const char *items[3] = { "PANTALLA", "MANDOS (BOTONES Y TURBO)", "VOLVER" };
+    int sel = 0, i;
+    g_stage = "opciones";
+    ui_prime();
+    while (g_running) {
+        uint16_t e;
+        pump();
+        e = ui_edges();
+        if (e & UI_UP)   sel = (sel + 2) % 3;
+        if (e & UI_DOWN) sel = (sel + 1) % 3;
+        if (e & UI_CANCEL) break;
+        if (e & (UI_OK | UI_START)) {
+            if (sel == 0) { ui_opt_screen(); ui_prime(); g_stage = "opciones"; }
+            else if (sel == 1) { ui_opt_pads(); ui_prime(); g_stage = "opciones"; }
+            else break;
+        }
+        ui_clear();
+        ui_center(20, "OPCIONES", 2, 0xFFFFD040);
+        ui_center(46, "SE GUARDAN SOLAS", 1, 0xFFC0C0FF);
+        for (i = 0; i < 3; i++) {
+            char line[40];
+            snprintf(line, sizeof line, "%s %s", i == sel ? ">" : " ", items[i]);
+            ui_center(84 + i * 22, line, 1, i == sel ? 0xFFFFFFFF : 0xFF8080A0);
+        }
+        ui_center(200, "ARRIBA/ABAJO + X", 1, 0xFF8080A0);
+        ui_center(214, "O: VOLVER", 1, 0xFF8080A0);
+        present();
+#ifdef NESNET_HOST
+        sleep_ms(16);
+#endif
+    }
+}
+
 static int ui_menu(void)
 {
-    static const char *items[5] = { "ELEGIR ROM", "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS", "MULTIJUGADOR DE 4" };
-    static const int modes[5] = { MODE_ROM, MODE_HOST, MODE_JOIN, MODE_SOLO, MODE_FOUR };   /* mismo orden que items */
+    static const char *items[6] = { "ELEGIR ROM", "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS", "MULTIJUGADOR DE 4", "OPCIONES" };
+    static const int modes[6] = { MODE_ROM, MODE_HOST, MODE_JOIN, MODE_SOLO, MODE_FOUR, MODE_OPT };   /* mismo orden que items */
     int i;
     g_stage = "menu";
     ui_prime();
@@ -2419,15 +2761,15 @@ static int ui_menu(void)
         char l[80], nm[48];
         pump();
         e = ui_edges();
-        if (e & UI_UP)   g_menu_sel = (g_menu_sel + 4) % 5;
-        if (e & UI_DOWN) g_menu_sel = (g_menu_sel + 1) % 5;
+        if (e & UI_UP)   g_menu_sel = (g_menu_sel + 5) % 6;
+        if (e & UI_DOWN) g_menu_sel = (g_menu_sel + 1) % 6;
         if (e & (UI_OK | UI_START)) {
-            /* sin ROM elegida el juego queda en stand-by: solo se puede entrar a ELEGIR ROM */
-            if (modes[g_menu_sel] != MODE_ROM && !g_rom) ui_message("PRIMERO ELIGE UNA ROM", "OPCION: ELEGIR ROM", 120);
+            /* sin ROM elegida el juego queda en stand-by: solo se puede entrar a ELEGIR ROM y a OPCIONES */
+            if (modes[g_menu_sel] != MODE_ROM && modes[g_menu_sel] != MODE_OPT && !g_rom) ui_message("PRIMERO ELIGE UNA ROM", "OPCION: ELEGIR ROM", 120);
             else return modes[g_menu_sel];
         }
         ui_clear();
-        ui_center(20, "NESNET V1.8.1", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.8.2", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         if (g_rom) {
             fit_name(nm, sizeof nm, g_rom_name, 34);
@@ -2436,12 +2778,12 @@ static int ui_menu(void)
         } else {
             ui_center(66, "ROM: NINGUNA (ELIGE UNA)", 1, 0xFFFFC040);
         }
-        for (i = 0; i < 5; i++) {
+        for (i = 0; i < 6; i++) {
             char line[40];
             uint32_t col = i == g_menu_sel ? 0xFFFFFFFF : 0xFF8080A0;
-            if (!g_rom && modes[i] != MODE_ROM) col = i == g_menu_sel ? 0xFFA0A0B0 : 0xFF505068;   /* bloqueadas sin ROM */
+            if (!g_rom && modes[i] != MODE_ROM && modes[i] != MODE_OPT) col = i == g_menu_sel ? 0xFFA0A0B0 : 0xFF505068;   /* bloqueadas sin ROM */
             snprintf(line, sizeof line, "%s %s", i == g_menu_sel ? ">" : " ", items[i]);
-            ui_center(92 + i * 20, line, 1, col);
+            ui_center(90 + i * 17, line, 1, col);
         }
         ui_center(200, "ARRIBA/ABAJO + X", 1, 0xFF8080A0);
         ui_center(214, "EN PARTIDA: R2 = SALIR", 1, 0xFF8080A0);
@@ -2469,7 +2811,7 @@ static int ui_menu4(void)
         if (e & UI_CANCEL) return -1;
         if (e & (UI_OK | UI_START)) return sel == 0 ? MODE_HOST : sel == 1 ? MODE_JOIN : -1;
         ui_clear();
-        ui_center(20, "NESNET V1.8.1", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.8.2", 2, 0xFFFFD040);
         ui_center(46, "MULTIJUGADOR DE 4 (FOUR SCORE)", 1, 0xFFC0C0FF);
         ui_center(66, "HOST: MANDOS 1 Y 2", 1, 0xFF80FF80);
         ui_center(80, "EL QUE SE UNE: MANDOS 3 Y 4", 1, 0xFF80FF80);
@@ -2510,7 +2852,7 @@ static int ui_enter_code(char *out)
         for (i = 0; i < 15; i++) digits[i] = (char)('0' + d[i]);
         digits[15] = 0;
         ui_clear();
-        ui_center(20, "NESNET V1.8.1", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.8.2", 2, 0xFFFFD040);
         ui_center(60, "ESCRIBE EL CODIGO DEL HOST", 1, 0xFFFFFFFF);
         for (i = 0; i < 15; i++) {
             char c[2] = { digits[i], 0 };
@@ -2604,7 +2946,7 @@ static int run_host_inner(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.8.1", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.8.2", 2, 0xFFFFD040);
         ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
         ui_center(84, code, 2, 0xFFFFFF40);
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -2745,7 +3087,7 @@ static int run_host4_inner(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.8.1", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.8.2", 2, 0xFFFFD040);
         ui_center(64, "SALA DE 4 - TU CODIGO:", 1, 0xFFFFFFFF);
         ui_center(84, code, 2, 0xFFFFFF40);
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -2847,9 +3189,10 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("NesNet v1.8.1 - dir=%s", g_dir);
+    logf_("NesNet v1.8.2 - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
+    opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
 }
 
 static int app_main(const char *argv0)
@@ -2871,6 +3214,11 @@ static int app_main(const char *argv0)
         if (choice < 0) break;
         if (choice == MODE_ROM) {
             if (ui_rom_select()) g_menu_sel = 1;          /* tras elegir, el cursor pasa a CREAR SALA */
+            choice = -1;
+            continue;
+        }
+        if (choice == MODE_OPT) {                         /* v1.8.2: OPCIONES (pantalla y mandos) no necesita ROM */
+            ui_options();
             choice = -1;
             continue;
         }
@@ -2961,7 +3309,7 @@ int main(int argc, char **argv)
         static const char *items[3] = { "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS" };
         int i;
         ui_clear();
-        ui_center(20, "NESNET V1.8.1", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.8.2", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         for (i = 0; i < 3; i++) {
             char line[40];
@@ -2973,7 +3321,7 @@ int main(int argc, char **argv)
             char code[20];
             code_encode(((uint32_t)181 << 24) | (45u << 16) | (200u << 8) | 17u, 7777, code);
             ui_clear();
-            ui_center(20, "NESNET V1.8.1", 2, 0xFFFFD040);
+            ui_center(20, "NESNET V1.8.2", 2, 0xFFFFD040);
             ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
             ui_center(84, code, 2, 0xFFFFFF40);
             ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -3050,6 +3398,218 @@ int main(int argc, char **argv)
             stick_nes_bits(255, 0) != (NB_RIGHT | NB_UP) || stick_nes_bits(0, 255) != (NB_LEFT | NB_DOWN) ||
             stick_nes_bits(128, 128) != 0 || stick_nes_bits(120, 140) != 0) bad++;
         printf("sticktest bad=%u (centro 128, zona muerta 78..178)\n", bad);
+        return bad != 0;
+    } else if (!strcmp(mode, "maptest")) {
+        /* v1.8.2: pruebas del mapeo de botones, el turbo y el guardado de opciones (funciones puras) */
+        unsigned bad = 0, n = 0, btns, d, p, i, f;
+        const uint16_t dirbits[4] = { NB_UP, NB_DOWN, NB_LEFT, NB_RIGHT };
+        /* 1) con el mapeo por defecto el resultado es IDENTICO a la formula de la v1.8.1 (todas las combinaciones de botones y direcciones) */
+        opts_defaults();
+        for (p = 0; p < 2; p++)
+            for (btns = 0; btns < (1u << PB_COUNT); btns++)
+                for (d = 0; d < 16; d++) {
+                    uint16_t dirs = 0, ref = 0;
+                    for (i = 0; i < 4; i++) if (d & (1u << i)) dirs |= dirbits[i];
+                    if (btns & PB_BIT(PB_CIRCLE)) ref |= NB_A;
+                    if (btns & PB_BIT(PB_CROSS))  ref |= NB_B;
+                    if (btns & PB_BIT(PB_SELECT)) ref |= NB_SEL;
+                    if (btns & PB_BIT(PB_START))  ref |= NB_START;
+                    ref |= dirs;
+                    if ((ref & NB_UP) && (ref & NB_DOWN))    ref &= (uint16_t)~NB_DOWN;
+                    if ((ref & NB_LEFT) && (ref & NB_RIGHT)) ref &= (uint16_t)~NB_RIGHT;
+                    n++;
+                    if (map_nes_bits((int)p, btns, dirs) != ref) bad++;
+                }
+        printf("maptest defecto==v1.8.1: %u combinaciones, bad=%u\n", n, bad);
+        /* 2) turbo: apretado 2 cuadros, suelto 2, empezando apretado; soltar reinicia; cada mando y cada turbo es independiente */
+        {
+            unsigned tb = 0;
+            opts_defaults();
+            g_map[0][MA_TA] = PB_SQUARE; g_map[0][MA_TB] = PB_TRIANGLE;
+            for (f = 0; f < 16; f++) {
+                uint16_t a = map_nes_bits(0, PB_BIT(PB_SQUARE), 0);
+                int want = ((f >> 1) & 1) == 0;
+                if (((a & NB_A) != 0) != want || (a & NB_B)) tb++;
+            }
+            (void)map_nes_bits(0, 0, 0);                                      /* soltar */
+            for (f = 0; f < 6; f++) {                                         /* turbo B: tambien empieza apretado */
+                uint16_t a = map_nes_bits(0, PB_BIT(PB_TRIANGLE), 0);
+                int want = ((f >> 1) & 1) == 0;
+                if (((a & NB_B) != 0) != want || (a & NB_A)) tb++;
+            }
+            (void)map_nes_bits(0, 0, 0);
+            if (!(map_nes_bits(0, PB_BIT(PB_SQUARE), 0) & NB_A)) tb++;        /* primer cuadro tras apretar = apretado */
+            (void)map_nes_bits(0, PB_BIT(PB_SQUARE), 0);
+            if (map_nes_bits(0, PB_BIT(PB_SQUARE), 0) & NB_A) tb++;           /* tercer cuadro = suelto */
+            for (f = 0; f < 8; f++) {                                         /* el mando 2 no tiene turbo asignado: nunca dispara */
+                if (map_nes_bits(1, PB_BIT(PB_SQUARE) | PB_BIT(PB_TRIANGLE), 0) & (NB_A | NB_B)) tb++;
+            }
+            (void)map_nes_bits(0, 0, 0);
+            for (f = 0; f < 8; f++) {                                         /* con A normal apretada, el turbo no la suelta */
+                if (!(map_nes_bits(0, PB_BIT(PB_CIRCLE) | PB_BIT(PB_SQUARE), 0) & NB_A)) tb++;
+            }
+            printf("maptest turbo: bad=%u\n", tb);
+            bad += tb;
+        }
+        /* 3) reglas de asignacion */
+        {
+            unsigned rb = 0, seen[PB_COUNT + 1], k;
+            opts_defaults();
+            map_cycle(0, MA_A, +1);                                           /* A: O -> CUADRADO (libre) */
+            if (g_map[0][MA_A] != PB_SQUARE) rb++;
+            opts_defaults();
+            map_cycle(0, MA_A, -1);                                           /* A hacia atras: salta X (B), "sin asignar" (no vale), SELECT y START (usados) -> R3 */
+            if (g_map[0][MA_A] != PB_R3 || g_map[0][MA_B] != PB_CROSS) rb++;
+            opts_defaults();
+            map_cycle(0, MA_TA, +1);                                          /* turbo A: sin asignar -> salta X y O (usados) -> CUADRADO */
+            if (g_map[0][MA_TA] != PB_SQUARE) rb++;
+            map_cycle(0, MA_TA, -1);                                          /* y hacia atras vuelve a sin asignar */
+            if (g_map[0][MA_TA] != PB_NONE) rb++;
+            map_assign(0, MA_TA, PB_NONE); map_assign(0, MA_TB, PB_NONE);     /* quitar un turbo ya quitado no toca nada mas */
+            if (g_map[0][MA_TA] != PB_NONE || g_map[0][MA_TB] != PB_NONE || g_map[0][MA_A] != PB_CIRCLE) rb++;
+            /* R2: el mando 1 nunca puede tenerlo; el mando 2 si. Se recorre todo el ciclo de un turbo */
+            for (p = 0; p < 2; p++) {
+                opts_defaults();
+                memset(seen, 0, sizeof seen);
+                for (k = 0; k < 40; k++) { map_cycle((int)p, MA_TA, +1); seen[g_map[p][MA_TA] + 1]++; }
+                if (p == 0 && seen[PB_R2 + 1] != 0) rb++;
+                if (p == 1 && seen[PB_R2 + 1] == 0) rb++;
+                if (seen[0] == 0) rb++;                                       /* "sin asignar" tambien se alcanza */
+                if (seen[PB_CROSS + 1] != 0 || seen[PB_CIRCLE + 1] != 0 || seen[PB_START + 1] != 0 || seen[PB_SELECT + 1] != 0) rb++;   /* nunca pisa botones usados */
+            }
+            /* mapeos guardados: validacion */
+            {
+                int ok[MA_COUNT]  = { PB_CIRCLE, PB_CROSS, PB_SELECT, PB_START, PB_NONE, PB_NONE };
+                int dup[MA_COUNT] = { PB_CIRCLE, PB_CIRCLE, PB_SELECT, PB_START, PB_NONE, PB_NONE };
+                int non[MA_COUNT] = { PB_NONE, PB_CROSS, PB_SELECT, PB_START, PB_NONE, PB_NONE };
+                int r2[MA_COUNT]  = { PB_R2, PB_CROSS, PB_SELECT, PB_START, PB_NONE, PB_NONE };
+                int big[MA_COUNT] = { PB_CIRCLE, PB_CROSS, PB_SELECT, PB_START, 99, PB_NONE };
+                if (!map_valid(ok, 0) || !map_valid(ok, 1)) rb++;
+                if (map_valid(dup, 0) || map_valid(non, 0) || map_valid(r2, 0) || map_valid(big, 1)) rb++;
+                if (!map_valid(r2, 1)) rb++;                                  /* R2 vale en el mando 2 */
+            }
+            printf("maptest reglas: bad=%u\n", rb);
+            bad += rb;
+        }
+        /* 4) fuzz: 300000 cambios al azar; el mapeo siempre queda valido (botones normales siempre con boton, sin repetidos, sin R2 en el mando 1) */
+        {
+            unsigned fb = 0;
+            srand(12345);
+            opts_defaults();
+            for (f = 0; f < 300000; f++) {
+                int pp = rand() & 1, act = rand() % MA_COUNT, dd = (rand() & 1) ? 1 : -1;
+                if ((rand() % 50) == 0) map_defaults(pp);
+                else if ((rand() % 7) == 0) { int b = (rand() % (PB_COUNT + 1)) - 1; if (map_allowed(pp, act, b)) map_assign(pp, act, b); }
+                else map_cycle(pp, act, dd);
+                if (!map_valid(g_map[0], 0) || !map_valid(g_map[1], 1)) fb++;
+            }
+            printf("maptest fuzz: bad=%u\n", fb);
+            bad += fb;
+        }
+        /* 5) guardar y cargar */
+        {
+            unsigned sb = 0;
+            char path[300], dir[] = "/tmp/nesnet_maptest";
+            FILE *fp;
+            int save_map[2][MA_COUNT], save_screen;
+            mkdir(dir, 0755);
+            snprintf(g_dir, sizeof g_dir, "%s", dir);
+            g_log = NULL;
+            opts_defaults();
+            g_map[0][MA_A] = PB_SQUARE; g_map[0][MA_TA] = PB_L1; g_map[1][MA_TB] = PB_R2; g_screen = 2;
+            opts_save();
+            memcpy(save_map, g_map, sizeof save_map); save_screen = g_screen;
+            opts_defaults();
+            opts_load();
+            if (memcmp(save_map, g_map, sizeof save_map) || g_screen != save_screen) sb++;
+            /* archivo estropeado: lineas basura, mapeo invalido del mando 1, pantalla fuera de rango: valen los defectos / lo valido */
+            snprintf(path, sizeof path, "%s/opciones.txt", dir);
+            fp = fopen(path, "w");
+            fprintf(fp, "basura\nscreen=9\npad1=3,3,3,3,3,3\npad2=1,0,11,10,-1,2\nxx=1\n");
+            fclose(fp);
+            opts_load();
+            if (g_screen != 0) sb++;                                          /* 9 no vale: queda la de por defecto */
+            if (g_map[0][MA_A] != PB_CIRCLE || g_map[0][MA_B] != PB_CROSS || g_map[0][MA_TA] != PB_NONE) sb++;   /* mando 1: invalido -> defecto */
+            if (g_map[1][MA_TB] != PB_SQUARE || g_map[1][MA_SEL] != PB_SELECT || g_map[1][MA_TA] != PB_NONE) sb++;   /* mando 2: valido, se respeta */
+            printf("maptest guardado: bad=%u\n", sb);
+            bad += sb;
+        }
+        printf("maptest TOTAL bad=%u\n", bad);
+        return bad != 0;
+    } else if (!strcmp(mode, "screentest")) {
+        /* v1.8.2: pruebas del escalado de pantalla (canvas_blit_cpu, la misma funcion que usa la PS3) */
+        static const int dims[4][3] = { { 1280, 720, 3 }, { 1920, 1080, 3 }, { 1920, 1080, 4 }, { 720, 480, 2 } };
+        unsigned bad = 0;
+        int di, md;
+        static uint32_t fbuf[SCR_W * SCR_H], buf[1920 * 1080], ref[1920 * 1080];
+        int x, y;
+        for (y = 0; y < SCR_H; y++) for (x = 0; x < SCR_W; x++) fbuf[y * SCR_W + x] = 0xFF000000u | ((uint32_t)y << 8) | (uint32_t)x;
+        for (di = 0; di < 4; di++) {
+            int dw = dims[di][0], dh = dims[di][1], z = dims[di][2];
+            for (md = 0; md < 3; md++) {
+                int oh = SCR_H * z, ow = screen_out_w(md, dw, oh, z);
+                int ox = (dw - ow) / 2, oy = (dh - oh) / 2, errs = 0, dx, dy;
+                unsigned fc = 0;
+                size_t i;
+                for (i = 0; i < (size_t)dw * dh; i++) buf[i] = 0xDEADBEEFu;     /* basura previa: lo de fuera de la imagen debe quedar en 0 */
+                canvas_blit_cpu(buf, dw, dh, md, z, fbuf, &fc);
+                for (dy = 0; dy < dh; dy++)
+                    for (dx = 0; dx < dw; dx++) {
+                        uint32_t got = buf[(size_t)dy * dw + dx], want = 0;
+                        if (dy >= oy && dy < oy + oh && dx >= ox && dx < ox + ow)
+                            want = fbuf[((dy - oy) / z) * SCR_W + ((dx - ox) * SCR_W / ow)];
+                        if (got != want) errs++;
+                    }
+                /* modo 0: identico, byte a byte, al escalado de la v1.8.1 (cada pixel repetido z veces) */
+                if (md == 0) {
+                    for (i = 0; i < (size_t)dw * dh; i++) ref[i] = 0;
+                    for (dy = 0; dy < oh; dy++)
+                        for (dx = 0; dx < SCR_W * z; dx++)
+                            ref[(size_t)(oy + dy) * dw + ox + dx] = fbuf[(dy / z) * SCR_W + dx / z];
+                    if (memcmp(buf, ref, (size_t)dw * dh * 4)) errs++;
+                }
+                /* repeticion de columnas en la primera fila: original a 720p = todas x3; 4:3 = 192 de x4 y 64 de x3; 16:9 = todas x5 */
+                if (dw == 1280 && dh == 720) {
+                    int run = 1, n3 = 0, n4 = 0, n5 = 0, nx = 0, row = oy * dw + ox;
+                    for (dx = 1; dx <= ow; dx++) {
+                        if (dx < ow && buf[row + dx] == buf[row + dx - 1]) { run++; continue; }
+                        if (run == 3) n3++; else if (run == 4) n4++; else if (run == 5) n5++; else nx++;
+                        run = 1;
+                    }
+                    if (md == 0 && !(ow == 768 && n3 == 256 && !n4 && !n5 && !nx)) errs++;
+                    if (md == 1 && !(ow == 960 && n4 == 192 && n3 == 64 && !n5 && !nx)) errs++;
+                    if (md == 2 && !(ow == 1280 && n5 == 256 && !n3 && !n4 && !nx)) errs++;
+                }
+                printf("screentest %dx%d z=%d modo=%d: imagen %dx%d en (%d,%d) errores=%d\n", dw, dh, z, md, ow, oh, ox, oy, errs);
+                bad += (unsigned)errs;
+            }
+        }
+        /* cambiar de modo no deja residuo: 16:9 durante 8 cuadros y luego original; a los 4 cuadros los bordes quedan limpios */
+        {
+            int dw = 1280, dh = 720, z = 3, k, dx, dy, errs = 0;
+            unsigned fc = 0;
+            size_t i;
+            for (i = 0; i < (size_t)dw * dh; i++) buf[i] = 0;
+            for (k = 0; k < 8; k++) canvas_blit_cpu(buf, dw, dh, 2, z, fbuf, &fc);
+            for (k = 0; k < 4; k++) canvas_blit_cpu(buf, dw, dh, 0, z, fbuf, &fc);
+            for (dy = 0; dy < dh; dy++)
+                for (dx = 0; dx < dw; dx++)
+                    if ((dx < 256 || dx >= 1024) && buf[(size_t)dy * dw + dx] != 0) errs++;
+            printf("screentest cambio 16:9 -> original: residuos=%d\n", errs);
+            bad += (unsigned)errs;
+        }
+        /* costo relativo en CPU (solo orientativo, en PC) */
+        {
+            int dw = 1280, dh = 720, z = 3, k;
+            unsigned fc = 0;
+            uint32_t t0;
+            for (md = 0; md < 3; md++) {
+                t0 = now_ms();
+                for (k = 0; k < 600; k++) canvas_blit_cpu(buf, dw, dh, md, z, fbuf, &fc);
+                printf("screentest tiempo modo %d: %u ms por 600 cuadros (PC)\n", md, (unsigned)(now_ms() - t0));
+            }
+        }
+        printf("screentest TOTAL bad=%u\n", bad);
         return bad != 0;
     } else if (!strcmp(mode, "ref4")) {
         /* v1.8: referencia de 4 jugadores locales con el mismo retraso D */
