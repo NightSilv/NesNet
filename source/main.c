@@ -634,6 +634,27 @@ static void au_open(void)
 static void au_open(void) {}
 #endif
 
+/* v1.8.1: palanca izquierda como cruz. Los ejes van de 0 a 255 con el centro cerca de 128. La zona muerta es
+ * amplia (50 de 128) para que un stick flojo o con deriva no mande movimientos sueltos. Funcion pura: se
+ * puede probar en PC. Devuelve -1 (izq/arriba), 0 (centro) o +1 (der/abajo) para cada eje. */
+#define STICK_DEAD 50
+static int stick_axis(unsigned v)
+{
+    if (v < 128u - STICK_DEAD) return -1;
+    if (v > 128u + STICK_DEAD) return 1;
+    return 0;
+}
+static uint16_t stick_nes_bits(unsigned h, unsigned v)
+{
+    uint16_t b = 0;
+    int ax = stick_axis(h), ay = stick_axis(v);
+    if (ax < 0) b |= NB_LEFT;
+    if (ax > 0) b |= NB_RIGHT;
+    if (ay < 0) b |= NB_UP;
+    if (ay > 0) b |= NB_DOWN;
+    return b;
+}
+
 #ifdef NESNET_PS3
 
 #define CB_SIZE   0x100000
@@ -962,6 +983,7 @@ static uint16_t pad_nes_bits(int port)
     if (d->BTN_DOWN)   b |= NB_DOWN;
     if (d->BTN_LEFT)   b |= NB_LEFT;
     if (d->BTN_RIGHT)  b |= NB_RIGHT;
+    b |= stick_nes_bits(d->ANA_L_H, d->ANA_L_V);          /* v1.8.1: palanca izquierda = cruz */
     if ((b & NB_UP) && (b & NB_DOWN))   b &= ~NB_DOWN;
     if ((b & NB_LEFT) && (b & NB_RIGHT)) b &= ~NB_RIGHT;
     return b;
@@ -975,6 +997,13 @@ static uint16_t ui_edges(void)
     if (d->BTN_DOWN)   c |= UI_DOWN;
     if (d->BTN_LEFT)   c |= UI_LEFT;
     if (d->BTN_RIGHT)  c |= UI_RIGHT;
+    {   /* v1.8.1: palanca izquierda tambien mueve los menus */
+        uint16_t sb = stick_nes_bits(d->ANA_L_H, d->ANA_L_V);
+        if (sb & NB_UP)    c |= UI_UP;
+        if (sb & NB_DOWN)  c |= UI_DOWN;
+        if (sb & NB_LEFT)  c |= UI_LEFT;
+        if (sb & NB_RIGHT) c |= UI_RIGHT;
+    }
     if (d->BTN_CROSS)  c |= UI_OK;
     if (d->BTN_CIRCLE) c |= UI_CANCEL;
     if (d->BTN_START)  c |= UI_START;
@@ -2289,7 +2318,7 @@ out:
 static void ui_show(const char *l1, const char *l2, const char *l3)
 {
     ui_clear();
-    ui_center(20, "NESNET V1.8", 2, 0xFFFFD040);
+    ui_center(20, "NESNET V1.8.1", 2, 0xFFFFD040);
     if (l1) ui_center(90, l1, 1, 0xFFFFFFFF);
     if (l2) ui_center(110, l2, 1, 0xFFC0C0FF);
     if (l3) ui_center(130, l3, 1, 0xFFC0C0FF);
@@ -2398,7 +2427,7 @@ static int ui_menu(void)
             else return modes[g_menu_sel];
         }
         ui_clear();
-        ui_center(20, "NESNET V1.8", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.8.1", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         if (g_rom) {
             fit_name(nm, sizeof nm, g_rom_name, 34);
@@ -2440,7 +2469,7 @@ static int ui_menu4(void)
         if (e & UI_CANCEL) return -1;
         if (e & (UI_OK | UI_START)) return sel == 0 ? MODE_HOST : sel == 1 ? MODE_JOIN : -1;
         ui_clear();
-        ui_center(20, "NESNET V1.8", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.8.1", 2, 0xFFFFD040);
         ui_center(46, "MULTIJUGADOR DE 4 (FOUR SCORE)", 1, 0xFFC0C0FF);
         ui_center(66, "HOST: MANDOS 1 Y 2", 1, 0xFF80FF80);
         ui_center(80, "EL QUE SE UNE: MANDOS 3 Y 4", 1, 0xFF80FF80);
@@ -2481,7 +2510,7 @@ static int ui_enter_code(char *out)
         for (i = 0; i < 15; i++) digits[i] = (char)('0' + d[i]);
         digits[15] = 0;
         ui_clear();
-        ui_center(20, "NESNET V1.8", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.8.1", 2, 0xFFFFD040);
         ui_center(60, "ESCRIBE EL CODIGO DEL HOST", 1, 0xFFFFFFFF);
         for (i = 0; i < 15; i++) {
             char c[2] = { digits[i], 0 };
@@ -2575,7 +2604,7 @@ static int run_host_inner(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.8", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.8.1", 2, 0xFFFFD040);
         ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
         ui_center(84, code, 2, 0xFFFFFF40);
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -2716,7 +2745,7 @@ static int run_host4_inner(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.8", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.8.1", 2, 0xFFFFD040);
         ui_center(64, "SALA DE 4 - TU CODIGO:", 1, 0xFFFFFFFF);
         ui_center(84, code, 2, 0xFFFFFF40);
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -2818,7 +2847,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("NesNet v1.8 - dir=%s", g_dir);
+    logf_("NesNet v1.8.1 - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
 }
@@ -2932,7 +2961,7 @@ int main(int argc, char **argv)
         static const char *items[3] = { "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS" };
         int i;
         ui_clear();
-        ui_center(20, "NESNET V1.8", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.8.1", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         for (i = 0; i < 3; i++) {
             char line[40];
@@ -2944,7 +2973,7 @@ int main(int argc, char **argv)
             char code[20];
             code_encode(((uint32_t)181 << 24) | (45u << 16) | (200u << 8) | 17u, 7777, code);
             ui_clear();
-            ui_center(20, "NESNET V1.8", 2, 0xFFFFD040);
+            ui_center(20, "NESNET V1.8.1", 2, 0xFFFFD040);
             ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
             ui_center(84, code, 2, 0xFFFFFF40);
             ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -3008,6 +3037,20 @@ int main(int argc, char **argv)
         ok = handshake_client(&D);
         if (ok) ok = run_online(0, D);
         if (!ok) fprintf(stderr, "ERROR: %s\n", g_err);
+    } else if (!strcmp(mode, "sticktest")) {
+        /* v1.8.1: prueba de la palanca: recorre los 256 valores de cada eje y comprueba direcciones y zona muerta */
+        unsigned v, bad = 0;
+        for (v = 0; v < 256; v++) {
+            uint16_t h = stick_nes_bits(v, 128), w = stick_nes_bits(128, v);
+            int exp = v < 78 ? -1 : v > 178 ? 1 : 0;
+            if (h != (exp < 0 ? NB_LEFT : exp > 0 ? NB_RIGHT : 0)) bad++;
+            if (w != (exp < 0 ? NB_UP : exp > 0 ? NB_DOWN : 0)) bad++;
+        }
+        if (stick_nes_bits(0, 0) != (NB_LEFT | NB_UP) || stick_nes_bits(255, 255) != (NB_RIGHT | NB_DOWN) ||
+            stick_nes_bits(255, 0) != (NB_RIGHT | NB_UP) || stick_nes_bits(0, 255) != (NB_LEFT | NB_DOWN) ||
+            stick_nes_bits(128, 128) != 0 || stick_nes_bits(120, 140) != 0) bad++;
+        printf("sticktest bad=%u (centro 128, zona muerta 78..178)\n", bad);
+        return bad != 0;
     } else if (!strcmp(mode, "ref4")) {
         /* v1.8: referencia de 4 jugadores locales con el mismo retraso D */
         D = argc > 4 ? atoi(argv[4]) : 6;
