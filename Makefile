@@ -28,6 +28,9 @@ PKGFILES = data
 
 BUILDDIR = build
 
+# Icono del XMB (320x176) en la raiz del repo; sin esto PSL1GHT usa uno generico
+ICON0    = $(CURDIR)/ICON0.PNG
+
 include $(PSL1GHT)/ppu_rules
 
 # make trae LD=ld por defecto y base_rules solo lo cambia si no existe: forzar ppu-gcc
