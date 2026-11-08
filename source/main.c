@@ -65,7 +65,8 @@ int closesocket(int s);      /* definida en libnet, pero sin prototipo en las ca
 /* ------------------------------------------------------------------ */
 /* v1.9.1: el mensaje M_RESET (reinicio sincronizado desde el menu R2) cambia el protocolo: una v1.9.1 y una v1.9
  * se rechazan entre si con el aviso "VERSIONES DISTINTAS DE NESNET" en vez de desincronizarse. */
-#define PROTO_VER      3
+/* v1.9.2: el mensaje M_GAME (el host cambia de juego desde R2) vuelve a cambiar el protocolo: 1vs1 = 5, modo de 4 = 6. */
+#define PROTO_VER      5
 #define DEFAULT_PORT   7777
 #define SCR_W          256
 #define SCR_H          240
@@ -82,8 +83,8 @@ int closesocket(int s);      /* definida en libnet, pero sin prototipo en las ca
 #define MODE_OPT       5      /* v1.8.2: opcion "OPCIONES" del menu (pantalla y mandos; no es un modo de juego) */
 
 /* v1.8: el modo de 4 jugadores es una COPIA aparte del 1vs1 y habla otro protocolo, asi un host de 1vs1
- * nunca acepta a alguien del modo de 4 (ni al reves). Desde la v1.9.1: 1vs1 = 3, modo de 4 = 4. */
-#define PROTO_VER4     4
+ * nunca acepta a alguien del modo de 4 (ni al reves). Desde la v1.9.2: 1vs1 = 5, modo de 4 = 6. */
+#define PROTO_VER4     6
 
 /* FCEUmm define su "GAMEPAD" como subclase 1 del mando (RETRO_DEVICE_GAMEPAD en su libretro.c) */
 #define NES_DEV_GAMEPAD RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_JOYPAD, 1)
@@ -689,6 +690,13 @@ static unsigned g_turbo_cnt[2][2];     /* cuadros seguidos que lleva apretado ca
 static int      g_screen;              /* 0 = original (pixeles cuadrados, como hasta ahora), 1 = 4:3 real, 2 = 16:9 estirada */
 static int      g_netinfo;             /* v1.9: info de red en partida: 0 = solo al inicio (como siempre), 1 = siempre, 2 = no */
 static char     g_last_rom[ROM_NAMELEN];   /* v1.9: nombre del archivo de la ultima ROM elegida */
+static int      g_showfps;             /* v1.9.2: 1 = FPS abajo a la derecha (en SOLO y online), 0 = no */
+/* v1.9.2: ajuste de imagen (OPCIONES > AJUSTE DE IMAGEN): tamano en % de la imagen de la pantalla elegida y
+ * desplazamiento en pixeles de la TV. Con los valores de siempre (100, 0, 0) se usa el dibujo de antes, sin cambios. */
+#define IMG_SIZE_MIN   70
+#define IMG_SHIFT_MAX  60
+static int      g_img_size = 100;
+static int      g_img_dx, g_img_dy;
 
 static void map_defaults(int p)
 {
@@ -815,6 +823,45 @@ static void canvas_blit_cpu(uint32_t *base, int dw, int dh, int mode, int z, con
     }
 }
 
+/* v1.9.2: dibujo con ajuste de imagen (tamano en % del lienzo de la pantalla elegida y desplazamiento en pixeles de la TV).
+ * Con size = 100 y dx = dy = 0 da EXACTAMENTE la misma imagen que canvas_blit_cpu (lo comprueba screentest); la PS3 sigue
+ * usando canvas_blit_cpu mientras no se toque el ajuste. Si la imagen se sale por un borde se recorta: nunca escribe fuera.
+ * Filas y columnas por vecino mas cercano (como el resto). Borra todo el buffer cuando cambia la posicion o el tamano
+ * (2 veces seguidas: un buffer de pantalla cada vez) y despues cada 4 cuadros de cada buffer, como canvas_blit_cpu. */
+static void canvas_blit_adj(uint32_t *base, int dw, int dh, int mode, int z, const uint32_t *fb, unsigned *fcnt,
+                            int size, int dx, int dy)
+{
+    static uint32_t row[COLMAP_MAX];
+    static int cm[COLMAP_MAX];
+    static int l_ow = -1;
+    static int geo[4] = { -1, -1, -1, -1 }, force_clear;
+    int oh0 = SCR_H * z, ow0 = screen_out_w(mode, dw, oh0, z);
+    int ow, oh, ox, oy, x0, x1, y0, y1, y, x, last_sy = -1;
+    if (z < 1 || ow0 < 1) return;
+    if (size < IMG_SIZE_MIN) size = IMG_SIZE_MIN;
+    if (size > 100) size = 100;
+    ow = ow0 * size / 100; oh = oh0 * size / 100;
+    if (ow < 1) ow = 1;
+    if (oh < 1) oh = 1;
+    ox = (dw - ow) / 2 + dx; oy = (dh - oh) / 2 + dy;
+    if (ow != l_ow) { for (x = 0; x < ow; x++) cm[x] = x * SCR_W / ow; l_ow = ow; }
+    if (ox != geo[0] || oy != geo[1] || ow != geo[2] || oh != geo[3]) { geo[0] = ox; geo[1] = oy; geo[2] = ow; geo[3] = oh; force_clear = 2; }
+    if (force_clear > 0) { force_clear--; (*fcnt)++; memset(base, 0, (size_t)dw * dh * 4); }
+    else if (((*fcnt)++ & 3) == 0) memset(base, 0, (size_t)dw * dh * 4);
+    x0 = ox < 0 ? 0 : ox;  x1 = ox + ow > dw ? dw : ox + ow;
+    y0 = oy < 0 ? 0 : oy;  y1 = oy + oh > dh ? dh : oy + oh;
+    if (x1 <= x0 || y1 <= y0) return;
+    for (y = y0; y < y1; y++) {
+        int sy = (y - oy) * SCR_H / oh;
+        if (sy != last_sy) {
+            const uint32_t *src = fb + sy * SCR_W;
+            for (x = x0; x < x1; x++) row[x - x0] = src[cm[x - ox]];
+            last_sy = sy;
+        }
+        memcpy(base + (size_t)y * dw + x0, row, (size_t)(x1 - x0) * 4);
+    }
+}
+
 /* Guardado de las opciones: USRDIR/opciones.txt (aparte de config.txt, que el instalador puede reemplazar) */
 static void opts_defaults(void)
 {
@@ -822,6 +869,8 @@ static void opts_defaults(void)
     g_screen = 0;
     g_volume = 100;
     g_netinfo = 0;
+    g_showfps = 0;
+    g_img_size = 100; g_img_dx = 0; g_img_dy = 0;
     g_last_rom[0] = 0;
 }
 
@@ -838,6 +887,10 @@ static void opts_save(void)
     fprintf(f, "screen=%d\n", g_screen);
     fprintf(f, "volume=%d\n", g_volume);
     fprintf(f, "netinfo=%d\n", g_netinfo);
+    fprintf(f, "fps=%d\n", g_showfps);
+    fprintf(f, "imgsize=%d\n", g_img_size);
+    fprintf(f, "imgx=%d\n", g_img_dx);
+    fprintf(f, "imgy=%d\n", g_img_dy);
     if (g_last_rom[0]) fprintf(f, "rom=%s\n", g_last_rom);
     for (p = 0; p < 2; p++)
         fprintf(f, "pad%d=%d,%d,%d,%d,%d,%d\n", p + 1, g_map[p][0], g_map[p][1], g_map[p][2], g_map[p][3], g_map[p][4], g_map[p][5]);
@@ -863,6 +916,14 @@ static void opts_load(void)
             if (v[0] >= 0 && v[0] <= 100) g_volume = v[0];
         } else if (sscanf(line, "netinfo=%d", &v[0]) == 1) {
             if (v[0] >= 0 && v[0] <= 2) g_netinfo = v[0];
+        } else if (sscanf(line, "fps=%d", &v[0]) == 1) {
+            if (v[0] == 0 || v[0] == 1) g_showfps = v[0];
+        } else if (sscanf(line, "imgsize=%d", &v[0]) == 1) {
+            if (v[0] >= IMG_SIZE_MIN && v[0] <= 100) g_img_size = v[0];
+        } else if (sscanf(line, "imgx=%d", &v[0]) == 1) {
+            if (v[0] >= -IMG_SHIFT_MAX && v[0] <= IMG_SHIFT_MAX) g_img_dx = v[0];
+        } else if (sscanf(line, "imgy=%d", &v[0]) == 1) {
+            if (v[0] >= -IMG_SHIFT_MAX && v[0] <= IMG_SHIFT_MAX) g_img_dy = v[0];
         } else if (!strncmp(line, "rom=", 4)) {
             size_t n = strlen(line + 4);
             while (n > 0 && (line[4 + n - 1] == '\n' || line[4 + n - 1] == '\r')) n--;
@@ -875,7 +936,8 @@ static void opts_load(void)
         }
     }
     fclose(f);
-    logf_("opciones: pantalla=%d volumen=%d info_red=%d  mando1=%d,%d,%d,%d,%d,%d  mando2=%d,%d,%d,%d,%d,%d", g_screen, g_volume, g_netinfo,
+    logf_("opciones: pantalla=%d volumen=%d info_red=%d fps=%d imagen=%d%%,%d,%d  mando1=%d,%d,%d,%d,%d,%d  mando2=%d,%d,%d,%d,%d,%d", g_screen, g_volume, g_netinfo,
+          g_showfps, g_img_size, g_img_dx, g_img_dy,
           g_map[0][0], g_map[0][1], g_map[0][2], g_map[0][3], g_map[0][4], g_map[0][5],
           g_map[1][0], g_map[1][1], g_map[1][2], g_map[1][3], g_map[1][4], g_map[1][5]);
     if (g_last_rom[0]) logf_("opciones: ultima ROM = %s", g_last_rom);
@@ -1063,7 +1125,11 @@ static void gpu_blit_canvas(void)
         /* v1.3: cada 4 cuadros DE CADA BUFFER se limpia lo que queda fuera del juego (bordes) para que no se quede el
          * residuo del XMB (reloj / bateria del mando); el juego mismo se repinta siempre.
          * v1.8.2: el escalado (modo de pantalla elegido en OPCIONES) y esa limpieza viven en canvas_blit_cpu. */
-        canvas_blit_cpu((uint32_t *)g_cbuf[g_cur], (int)g_dw, (int)g_dh, g_screen, g_zoom, (const uint32_t *)g_fb, &cpu_frame[g_cur & 1]);
+        if (g_img_size == 100 && g_img_dx == 0 && g_img_dy == 0)
+            canvas_blit_cpu((uint32_t *)g_cbuf[g_cur], (int)g_dw, (int)g_dh, g_screen, g_zoom, (const uint32_t *)g_fb, &cpu_frame[g_cur & 1]);
+        else   /* v1.9.2: con el ajuste de imagen tocado */
+            canvas_blit_adj((uint32_t *)g_cbuf[g_cur], (int)g_dw, (int)g_dh, g_screen, g_zoom, (const uint32_t *)g_fb, &cpu_frame[g_cur & 1],
+                            g_img_size, g_img_dx, g_img_dy);
         return;
     }
 
@@ -1744,7 +1810,10 @@ static void step_frame4(uint16_t p1, uint16_t p2, uint16_t p3, uint16_t p4)
 /* ------------------------------------------------------------------ */
 /* Red: mensajes de 16 bytes, TCP, poll() con espera propia            */
 /* ------------------------------------------------------------------ */
-enum { M_HELLO = 1, M_PING, M_PONG, M_CFG, M_START, M_INPUT, M_QUIT, M_REJECT, M_RESET };   /* v1.9.1: M_RESET (frame = cuadro en que ambos reinician) */
+enum { M_HELLO = 1, M_PING, M_PONG, M_CFG, M_START, M_INPUT, M_QUIT, M_REJECT, M_RESET, M_GAME };   /* v1.9.1: M_RESET (frame = cuadro en que ambos reinician); v1.9.2: M_GAME (cambio de juego) */
+/* v1.9.2: M_GAME, campo 'a': pregunta del host (v1 = CRC32 de la ROM, v2 = tamano) / "la tengo" / "no la tengo" /
+ * corte (frame = cuadro en que los dos cambian, v1 = CRC32) / marca de fin de lo viejo (ver game_switch_apply) */
+enum { GM_ASK = 1, GM_HAVE, GM_MISS, GM_GO, GM_MARK };
 
 typedef struct {
     uint8_t  type, a;
@@ -2443,20 +2512,39 @@ static int exit_menu(int online)
     return r == 1;
 }
 
-enum { MK_CONT, MK_SAVE, MK_LOAD, MK_RESET, MK_EXIT };
+/* v1.9.2: mientras hay una partida online abierta, los menus (R2 y el selector de juego) mandan un aviso corto (M_PING, que
+ * la partida ignora) cada ~1 s: el otro lado solo se rinde tras 15 s sin recibir nada, y un menu abierto mas tiempo lo cortaba. */
+static int      g_ka_on;                 /* 1 = hay partida online abierta */
+static uint32_t g_ka_last;
+static void ui_keepalive(void)
+{
+    uint32_t now;
+    if (!g_ka_on || g_net < 0) return;
+    now = now_ms();
+    if (now - g_ka_last < 1000) return;
+    g_ka_last = now;
+    { Msg k; memset(&k, 0, sizeof k); k.type = M_PING; k.v1 = 0xFFFFFFFFu; (void)net_send(&k); }
+}
+
+static int ui_rom_select(int pick_only);     /* v1.9.2: definido mas abajo; con pick_only = 1 solo elige (no carga) */
+static void ui_show(const char *l1, const char *l2, const char *l3);
+
+enum { MK_CONT, MK_SAVE, MK_LOAD, MK_GAME, MK_RESET, MK_EXIT };
 
 /* v1.9.1: menu de R2.
  *   SOLO:   CONTINUAR / GUARDAR ESTADO / CARGAR ESTADO / REINICIAR EL JUEGO / SALIR DE LA PARTIDA
  *   ONLINE: CONTINUAR / REINICIAR EL JUEGO / SALIR DE LA PARTIDA (reiniciar y salir valen para los dos; sin estados)
+ *   v1.9.2: el HOST en online tiene ademas CAMBIAR DE JUEGO (despues de CONTINUAR).
  * Reiniciar, salir, cargar y sobreescribir piden confirmar con X.
- * Devuelve 0 = seguir jugando, 1 = salir, 2 = reiniciar, 10+n = guardar en la ranura n, 20+n = cargar la ranura n (n = 0..2). */
-static int solo_menu(int online)
+ * Devuelve 0 = seguir jugando, 1 = salir, 2 = reiniciar, 3 = cambiar de juego, 10+n = guardar en la ranura n, 20+n = cargar la ranura n (n = 0..2). */
+static int solo_menu(int online, int host)
 {
-    int kinds[5], nk = 0, sel = 0, r = -1, confirm = -1, x, y, i;
+    int kinds[6], nk = 0, sel = 0, r = -1, confirm = -1, x, y, i;
     int ex[STATE_SLOTS];
     const char *note = NULL;
     kinds[nk++] = MK_CONT;
     if (!online) { kinds[nk++] = MK_SAVE; kinds[nk++] = MK_LOAD; }
+    else if (host) kinds[nk++] = MK_GAME;
     kinds[nk++] = MK_RESET; kinds[nk++] = MK_EXIT;
     for (i = 0; i < STATE_SLOTS; i++) ex[i] = online ? 0 : state_exists(i);
     memcpy(g_fb_save, g_fb, sizeof g_fb);
@@ -2466,6 +2554,7 @@ static int solo_menu(int online)
         uint16_t e;
         int k;
         pump();
+        ui_keepalive();
         e = ui_edges();
         if (confirm >= 0) {
             if (e & UI_OK) {
@@ -2487,6 +2576,7 @@ static int solo_menu(int online)
                 if (k == MK_CONT) r = 0;
                 else if (k == MK_SAVE) { if (ex[g_state_slot]) confirm = MK_SAVE; else r = 10 + g_state_slot; }
                 else if (k == MK_LOAD) { if (ex[g_state_slot]) confirm = MK_LOAD; else note = "ESA RANURA ESTA VACIA"; }
+                else if (k == MK_GAME) r = 3;          /* el selector de juegos hace de confirmacion (O: volver) */
                 else confirm = k;
             }
         }
@@ -2518,6 +2608,7 @@ static int solo_menu(int online)
                 case MK_CONT:  snprintf(l, sizeof l, "%s", "CONTINUAR"); break;
                 case MK_SAVE:  snprintf(l, sizeof l, "GUARDAR ESTADO < %d >", g_state_slot + 1); break;
                 case MK_LOAD:  snprintf(l, sizeof l, "CARGAR ESTADO < %d >%s", g_state_slot + 1, ex[g_state_slot] ? "" : " (VACIA)"); break;
+                case MK_GAME:  snprintf(l, sizeof l, "%s", "CAMBIAR DE JUEGO"); break;
                 case MK_RESET: snprintf(l, sizeof l, "%s", "REINICIAR EL JUEGO"); break;
                 default:       snprintf(l, sizeof l, "%s", "SALIR DE LA PARTIDA"); break;
                 }
@@ -2529,7 +2620,8 @@ static int solo_menu(int online)
             }
             if (note) ui_center(158, note, 1, 0xFFFFC040);
             ui_center(172, "ARRIBA/ABAJO + X   O: SEGUIR", 1, 0xFF8080A0);
-            if (online) ui_center(184, "REINICIAR Y SALIR: PARA LOS DOS", 1, 0xFF8080A0);
+            if (online && kinds[sel] == MK_GAME) ui_center(184, "SE LE PREGUNTA ANTES A TU AMIGO", 1, 0xFF8080A0);
+            else if (online) ui_center(184, "REINICIAR Y SALIR: PARA LOS DOS", 1, 0xFF8080A0);
             else if (kinds[sel] == MK_SAVE || kinds[sel] == MK_LOAD) ui_center(184, "IZQ/DER: CAMBIAR DE RANURA", 1, 0xFF8080A0);
         }
         present();
@@ -2560,6 +2652,18 @@ static void netinfo_tick(void)
     }
 }
 
+/* v1.9.2: FPS abajo a la derecha (OPCIONES > FPS EN PANTALLA). Usa la misma medicion de netinfo_tick (cuadros por segundo reales,
+ * incluida la espera por el otro lado); el primer segundo sale "--". Solo dibujo: no toca la red ni el juego. */
+static void ui_fps(void)
+{
+    char fp[16];
+    int x0, x1, y0, y1, x, y;
+    if (g_ni_fps) snprintf(fp, sizeof fp, "FPS %u", (unsigned)g_ni_fps); else snprintf(fp, sizeof fp, "FPS --");
+    x0 = SCR_W - (int)strlen(fp) * 6 - 5; x1 = SCR_W; y0 = SCR_H - 13; y1 = SCR_H;        /* recuadro negro para que se lea sobre cualquier juego */
+    for (y = y0; y < y1; y++) for (x = x0; x < x1; x++) g_fb[y * SCR_W + x] = 0xFF000000u;
+    ui_text(SCR_W - (int)strlen(fp) * 6 - 3, SCR_H - 12, fp, 1, 0xFF80FF80);
+}
+
 static int netinfo_show(uint32_t frame)
 {
     if (g_desyncs) return 1;                 /* el aviso rojo de desync siempre sale */
@@ -2588,6 +2692,154 @@ static int rst_due(uint32_t *rst, uint32_t frame)
 static uint32_t g_ref_reset[2] = { NO_FRAME, NO_FRAME };   /* pruebas: cuadros en que la referencia reinicia (NESNET_RESET_REF=a,b) */
 #endif
 
+/* ------------------------------------------------------------------ */
+/* v1.9.2: CAMBIAR DE JUEGO en partida online (lo pide el HOST desde R2; vale para 1vs1 y para el modo de 4).        */
+/*  1) El host elige la ROM en el selector (no la carga) y manda GM_ASK con su CRC32 y tamano. La partida SIGUE.        */
+/*  2) El otro lado busca esa ROM en su carpeta roms (por CRC32, no por nombre) y contesta GM_HAVE o GM_MISS.          */
+/*     Si no la tiene, el host avisa en pantalla y nadie cambia nada.                                                  */
+/*  3) Con GM_HAVE el host manda GM_GO con el cuadro de corte S = su cuadro + D + 1 (igual que el reinicio de la        */
+/*     v1.9.1: por el orden del TCP el otro lado lo lee antes de poder pasar de S) y los dos terminan la partida en    */
+/*     ese cuadro SIN avisar de salida. Despues cada lado manda GM_MARK y descarta lo que llegue hasta recibir la del    */
+/*     otro (entradas viejas ya adelantadas), carga la ROM, comprueba el CRC32 y empieza una partida nueva con el mismo  */
+/*     delay D (sin repetir el handshake). Lo de antes (entradas, desync, reinicio) no cambia.                           */
+/* ------------------------------------------------------------------ */
+typedef struct {
+    int      asked;      /* host: ya mando la pregunta y espera la respuesta */
+    uint32_t asked_ms;   /* host: cuando la mando */
+    int      have;       /* el que se une: ya contesto que si tiene la ROM */
+    uint32_t go;         /* cuadro del corte (NO_FRAME = ninguno) */
+    int      mark_rx;    /* ya llego la marca GM_MARK del otro lado (el bucle de la partida la puede leer antes de salir) */
+} GameSw;
+static GameSw   g_gsw;
+static char     g_sw_name[ROM_NAMELEN];   /* ROM nueva: nombre del archivo en roms/ */
+static uint32_t g_sw_crc, g_sw_size;
+static int      g_sw_pending;             /* 1 = el bucle termino por un cambio de juego: run_online / run_online4 hacen el corte */
+static char     g_pick_name[ROM_NAMELEN]; /* resultado de ui_rom_select(1) */
+static uint32_t g_pick_crc, g_pick_size;
+
+/* Busca en USRDIR/roms la ROM con ese CRC32 y tamano (solo lee los archivos que tienen ese tamano). 1 = la encontro */
+static int rom_find_crc(uint32_t crc, uint32_t size, char *name_out)
+{
+    int i;
+    roms_scan();
+    for (i = 0; i < g_nroms; i++) {
+        uint8_t *b = NULL;
+        size_t bs = 0;
+        char rp[420];
+        uint32_t c;
+        if (g_roms[i].size != size) continue;
+        snprintf(rp, sizeof rp, "%s/roms/%s", g_dir, g_roms[i].name);
+        if (!read_whole_file(rp, &b, &bs)) continue;
+        c = crc32_buf(b, bs);
+        free(b);
+        if (c == crc && bs == size) { snprintf(name_out, ROM_NAMELEN, "%s", g_roms[i].name); return 1; }
+    }
+    return 0;
+}
+
+/* Atiende un M_GAME que llega durante la partida. role: 0 = host, 1 = el que se une; frame = cuadro actual de este lado.
+ * 0 = fallo al mandar la respuesta (el que llama lo trata como conexion caida) */
+static int gsw_on_msg(const Msg *m, int role, uint32_t frame, int D)
+{
+    Msg r;
+    memset(&r, 0, sizeof r);
+    r.type = M_GAME;
+    if (role == 1 && m->a == GM_ASK) {
+        char nm[ROM_NAMELEN];
+        r.v1 = m->v1;
+        if (g_gsw.go == NO_FRAME && rom_find_crc(m->v1, m->v2, nm)) {
+            snprintf(g_sw_name, sizeof g_sw_name, "%s", nm);
+            g_sw_crc = m->v1; g_sw_size = m->v2; g_gsw.have = 1;
+            r.a = GM_HAVE;
+            logf_("cambio de juego: tengo la ROM %s (crc32 %08X)", nm, (unsigned)m->v1);
+        } else {
+            r.a = GM_MISS;
+            logf_("cambio de juego: NO tengo la ROM (crc32 %08X)", (unsigned)m->v1);
+        }
+        return net_send(&r);
+    }
+    if (role == 0 && m->a == GM_HAVE && g_gsw.asked && m->v1 == g_sw_crc) {
+        uint32_t S = frame + (uint32_t)D + 1;
+        g_gsw.asked = 0; g_gsw.go = S;
+        r.a = GM_GO; r.frame = S; r.v1 = g_sw_crc;
+        logf_("cambio de juego: el amigo tiene la ROM; los dos cambian a %s en el frame %u (ahora %u)", g_sw_name, (unsigned)S, (unsigned)frame);
+        return net_send(&r);
+    }
+    if (role == 0 && m->a == GM_MISS && g_gsw.asked && m->v1 == g_sw_crc) {
+        g_gsw.asked = 0;
+        toast("TU AMIGO NO TIENE ESA ROM");
+        logf_("cambio de juego: el amigo NO tiene la ROM %s", g_sw_name);
+        return 1;
+    }
+    if (m->a == GM_MARK) {
+        /* El otro lado ya salio de su partida. Despues de su marca no manda NADA hasta recibir la mia, asi que no hay datos
+         * de la partida nueva mezclados con los de la vieja. Solo se anota: game_switch_apply no la espera de nuevo. */
+        g_gsw.mark_rx = 1;
+        return 1;
+    }
+    if (role == 1 && m->a == GM_GO && g_gsw.have && m->v1 == g_sw_crc) {
+        g_gsw.have = 0; g_gsw.go = m->frame;
+        logf_("cambio de juego: el host manda cambiar a %s en el frame %u (ahora %u)", g_sw_name, (unsigned)m->frame, (unsigned)frame);
+        return 1;
+    }
+    return 1;
+}
+
+/* Host: abre el selector de juegos y, si elige uno distinto del actual, le pregunta al amigo. 0 = fallo al mandar */
+static int gsw_ask_host(void)
+{
+    Msg q;
+    if (g_gsw.asked || g_gsw.go != NO_FRAME) { toast("ESPERA: YA SE LE PREGUNTO"); return 1; }
+#ifdef NESNET_HOST
+    if (getenv("NESNET_STALL_MS")) {                              /* prueba: menu abierto mucho rato (comprueba el aviso de ui_keepalive) */
+        uint32_t t0 = now_ms(), lim = (uint32_t)atoi(getenv("NESNET_STALL_MS"));
+        while (g_running && now_ms() - t0 < lim) { pump(); ui_keepalive(); sleep_ms(50); }
+    }
+#endif
+    if (!ui_rom_select(1)) return 1;                              /* volvio sin elegir */
+    if (g_pick_crc == g_romcrc) { toast("YA ESTAS CON ESE JUEGO"); return 1; }
+    snprintf(g_sw_name, sizeof g_sw_name, "%s", g_pick_name);
+    g_sw_crc = g_pick_crc; g_sw_size = g_pick_size;
+    memset(&q, 0, sizeof q);
+    q.type = M_GAME; q.a = GM_ASK; q.v1 = g_sw_crc; q.v2 = g_sw_size;
+    g_gsw.asked = 1; g_gsw.asked_ms = now_ms();
+    toast("PREGUNTANDO A TU AMIGO...");
+    logf_("cambio de juego: pregunto por %s (%u bytes, crc32 %08X)", g_sw_name, (unsigned)g_sw_size, (unsigned)g_sw_crc);
+    return net_send(&q);
+}
+
+/* Despues de que session_loop termino por un cambio de juego (g_sw_pending), en las DOS consolas: marca de fin de lo viejo
+ * (descarta lo que llegue hasta recibir la del otro), carga la ROM nueva y comprueba su CRC32. 1 = listo para la partida nueva */
+static int game_switch_apply(void)
+{
+    Msg m;
+    uint32_t t0 = now_ms();
+    int i;
+    ui_show("CAMBIANDO DE JUEGO...", g_sw_name, NULL);
+    memset(&m, 0, sizeof m); m.type = M_GAME; m.a = GM_MARK;
+    if (!net_send(&m)) { g_err = "SE PERDIO LA CONEXION"; return 0; }
+    while (!g_gsw.mark_rx) {                                      /* si la marca ya llego durante la partida, no hay nada que esperar */
+        int r = net_recv(&m, 100);
+        if (r < 0) { g_err = "SE PERDIO LA CONEXION"; return 0; }
+        if (r > 0) {
+            if (m.type == M_GAME && m.a == GM_MARK) break;
+            if (m.type == M_QUIT) { g_err = "EL AMIGO SALIO DE LA PARTIDA"; return 0; }
+            continue;                                             /* entradas viejas y avisos: se descartan */
+        }
+        if (!g_running) return 0;
+        if (now_ms() - t0 > 15000) { g_err = "EL AMIGO NO RESPONDE (15 S)"; return 0; }
+    }
+    for (i = 0; i < g_nroms; i++) if (!strcmp(g_roms[i].name, g_sw_name)) break;
+    if (i >= g_nroms) { roms_scan(); for (i = 0; i < g_nroms; i++) if (!strcmp(g_roms[i].name, g_sw_name)) break; }
+    if (i >= g_nroms || !rom_load(i)) { g_err = "NO PUDE CARGAR LA ROM NUEVA"; return 0; }
+    if (g_romcrc != g_sw_crc) { g_err = "LA ROM NO ES LA DEL AMIGO"; return 0; }
+    snprintf(g_last_rom, sizeof g_last_rom, "%s", g_rom_name);   /* el menu y el proximo arranque la recuerdan */
+    opts_save();
+    g_toast_n = 0;
+    logf_("cambio de juego: listo, ROM nueva %s (crc32 %08X)", g_rom_name, (unsigned)g_romcrc);
+    return 1;
+}
+
 static int session_loop(int role, int D, uint32_t maxframes)
 {
     uint16_t loc[RING], rem[RING];
@@ -2605,6 +2857,9 @@ static int session_loop(int role, int D, uint32_t maxframes)
 
     g_run_hash = 2166136261u; g_frames_done = 0; g_desyncs = 0; g_first_desync = NO_FRAME;
     g_stage = role == 0 ? "juego-host" : role == 1 ? "juego-cliente" : "juego-local";
+    memset(&g_gsw, 0, sizeof g_gsw); g_gsw.go = NO_FRAME; g_sw_pending = 0;      /* v1.9.2: cambio de juego */
+    g_ka_on = role >= 0; g_ka_last = now_ms();
+    g_ni_t0 = 0; g_ni_last = 0; g_ni_fps = 0;
 
 #define COMPARE(f) do { uint32_t _f = (f); \
         if (mine_f[_f % RING] == _f && rem_f[_f % RING] == _f && \
@@ -2618,13 +2873,17 @@ static int session_loop(int role, int D, uint32_t maxframes)
     while (g_running && (maxframes == 0 || frame < maxframes)) {
         uint16_t p1, p2;
         pump();
+        /* v1.9.2: cambio de juego: llego el cuadro de corte (se mira ANTES de mandar la entrada de este cuadro) */
+        if (g_gsw.go != NO_FRAME && frame >= g_gsw.go) { g_sw_pending = 1; goto out; }
+        if (g_gsw.asked && now_ms() - g_gsw.asked_ms > 20000) { g_gsw.asked = 0; toast("TU AMIGO NO RESPONDIO"); logf_("cambio de juego: sin respuesta del amigo (20 s)"); }
 
         /* v1.7: R2 abre el menu de salir. Se mira antes de mandar la entrada de este frame; si sigue, el
          * otro lado simplemente espera como siempre. No cambia nada del protocolo ni del lockstep. */
         if (role != -2 && exit_pressed(0, frame)) {
             /* v1.9.1: SOLO = continuar / guardar y cargar estado / reiniciar / salir; online = continuar / reiniciar / salir */
-            int xr = solo_menu(role >= 0);
+            int xr = solo_menu(role >= 0, role == 0);
             if (xr == 1) { user_exit = 1; logf_("salida pedida por el jugador (R2) en frame %u", (unsigned)frame); goto out; }
+            if (xr == 3 && role == 0) { if (!gsw_ask_host()) peer_gone = 1; }       /* v1.9.2: cambiar de juego (solo el host) */
             if (xr == 2) {
                 if (role >= 0) {
                     Msg rq;
@@ -2648,6 +2907,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
                 toast(tb);
             }
             last_rx = now_ms();
+            g_ni_t0 = 0; g_ni_last = 0;               /* v1.9.2: el FPS vuelve a medir despues del menu */
         }
 
         if (role == -1) {
@@ -2690,9 +2950,12 @@ static int session_loop(int role, int D, uint32_t maxframes)
                     if (m.v1 != NO_FRAME) { rem_f[m.v1 % RING] = m.v1; rem_c[m.v1 % RING] = m.v2; COMPARE(m.v1); }
                 } else if (m.type == M_RESET) {
                     rst_add(rst, m.frame);
+                } else if (m.type == M_GAME) {                      /* v1.9.2: cambio de juego */
+                    if (!gsw_on_msg(&m, role, frame, D)) peer_gone = 1;
                 } else if (m.type == M_QUIT) {
                     peer_quit = 1; peer_gone = 1;
                 }
+                if (g_gsw.go != NO_FRAME && frame >= g_gsw.go) { g_sw_pending = 1; goto out; }   /* el corte llego mientras esperaba */
             }
             have[frame % RING] = 0;
             {
@@ -2729,14 +2992,16 @@ static int session_loop(int role, int D, uint32_t maxframes)
             ui_text(2, 2, ov, 1, g_desyncs ? 0xFFFF4040 : 0xFFFFFFFF);
         }
         if (g_toast_n > 0) { ui_text(4, 224, g_toast, 1, 0xFFFFFF40); g_toast_n--; }
+        if (g_showfps && role != -2) ui_fps();                           /* v1.9.2: FPS en pantalla (SOLO y online) */
         present();
-        if (role >= 0 && g_netinfo == 1) netinfo_tick();
+        if ((role >= 0 && g_netinfo == 1) || (g_showfps && role != -2)) netinfo_tick();
         frame++;
         g_frames_done = frame;
         if (role == -1 && (frame % 300) == 0) sram_save(0);      /* v1.9: guardado de bateria cada ~5 s si cambio (solo SOLO) */
     }
 out:
-    if (role >= 0 && g_net >= 0) {
+    g_ka_on = 0;
+    if (role >= 0 && g_net >= 0 && !g_sw_pending) {       /* v1.9.2: en un cambio de juego no se avisa de salida */
         Msg q; memset(&q, 0, sizeof q); q.type = M_QUIT; net_send(&q);
         if (user_exit) {
             /* v1.7: vacia lo que el otro lado alcance a mandar (hasta 300 ms o hasta que cierre), para que
@@ -2783,6 +3048,9 @@ static int session_loop4(int role, int D, uint32_t maxframes)
 
     g_run_hash = 2166136261u; g_frames_done = 0; g_desyncs = 0; g_first_desync = NO_FRAME;
     g_stage = role == 0 ? "juego4-host" : role == 1 ? "juego4-cliente" : "juego4-ref";
+    memset(&g_gsw, 0, sizeof g_gsw); g_gsw.go = NO_FRAME; g_sw_pending = 0;      /* v1.9.2: cambio de juego */
+    g_ka_on = role >= 0; g_ka_last = now_ms();
+    g_ni_t0 = 0; g_ni_last = 0; g_ni_fps = 0;
 
 #define COMPARE4(f) do { uint32_t _f = (f); \
         if (mine_f[_f % RING] == _f && rem_f[_f % RING] == _f && \
@@ -2796,11 +3064,15 @@ static int session_loop4(int role, int D, uint32_t maxframes)
     while (g_running && (maxframes == 0 || frame < maxframes)) {
         uint16_t p1, p2, p3, p4;
         pump();
+        /* v1.9.2: cambio de juego (igual que en el 1vs1) */
+        if (g_gsw.go != NO_FRAME && frame >= g_gsw.go) { g_sw_pending = 1; goto out; }
+        if (g_gsw.asked && now_ms() - g_gsw.asked_ms > 20000) { g_gsw.asked = 0; toast("TU AMIGO NO RESPONDIO"); logf_("cambio de juego: sin respuesta del amigo (20 s)"); }
 
         /* R2 del mando 1 de esta consola abre el menu (igual que en el 1vs1): continuar / reiniciar / salir */
         if (role != -2 && exit_pressed(0, frame)) {
-            int xr = solo_menu(1);
+            int xr = solo_menu(1, role == 0);
             if (xr == 1) { user_exit = 1; logf_("salida pedida por el jugador (R2) en frame %u", (unsigned)frame); goto out; }
+            if (xr == 3 && role == 0) { if (!gsw_ask_host()) peer_gone = 1; }       /* v1.9.2: cambiar de juego (solo el host) */
             if (xr == 2) {
                 Msg rq;
                 uint32_t F = frame + (uint32_t)D;
@@ -2810,6 +3082,7 @@ static int session_loop4(int role, int D, uint32_t maxframes)
                 logf_("reinicio pedido por el jugador (R2) en frame %u: los dos reinician en el frame %u", (unsigned)frame, (unsigned)F);
             }
             last_rx = now_ms();
+            g_ni_t0 = 0; g_ni_last = 0;               /* v1.9.2: el FPS vuelve a medir despues del menu */
         }
 
         if (role == -2) {
@@ -2857,9 +3130,12 @@ static int session_loop4(int role, int D, uint32_t maxframes)
                     if (m.v1 != NO_FRAME) { rem_f[m.v1 % RING] = m.v1; rem_c[m.v1 % RING] = m.v2; COMPARE4(m.v1); }
                 } else if (m.type == M_RESET) {
                     rst_add(rst, m.frame);
+                } else if (m.type == M_GAME) {                      /* v1.9.2: cambio de juego */
+                    if (!gsw_on_msg(&m, role, frame, D)) peer_gone = 1;
                 } else if (m.type == M_QUIT) {
                     peer_quit = 1; peer_gone = 1;
                 }
+                if (g_gsw.go != NO_FRAME && frame >= g_gsw.go) { g_sw_pending = 1; goto out; }   /* el corte llego mientras esperaba */
             }
             have[frame % RING] = 0;
             {
@@ -2897,13 +3173,16 @@ static int session_loop4(int role, int D, uint32_t maxframes)
             else snprintf(ov, sizeof ov, "NESNET 4J  %s  DELAY %d", role == 0 ? "P1+P2" : "P3+P4", D);
             ui_text(2, 2, ov, 1, g_desyncs ? 0xFFFF4040 : 0xFFFFFFFF);
         }
+        if (g_toast_n > 0) { ui_text(4, 224, g_toast, 1, 0xFFFFFF40); g_toast_n--; }      /* v1.9.2: avisos tambien en el modo de 4 */
+        if (g_showfps && role != -2) ui_fps();                           /* v1.9.2: FPS en pantalla */
         present();
-        if (role >= 0 && g_netinfo == 1) netinfo_tick();
+        if ((role >= 0 && g_netinfo == 1) || (g_showfps && role != -2)) netinfo_tick();
         frame++;
         g_frames_done = frame;
     }
 out:
-    if (role >= 0 && g_net >= 0) {
+    g_ka_on = 0;
+    if (role >= 0 && g_net >= 0 && !g_sw_pending) {       /* v1.9.2: en un cambio de juego no se avisa de salida */
         Msg q; memset(&q, 0, sizeof q); q.type = M_QUIT; net_send(&q);
         if (user_exit) {
             /* vacia lo que el otro lado alcance a mandar (hasta 300 ms o hasta que cierre), para que
@@ -2929,7 +3208,7 @@ out:
 static void ui_show(const char *l1, const char *l2, const char *l3)
 {
     ui_clear();
-    ui_center(20, "NESNET V1.9.1", 2, 0xFFFFD040);
+    ui_center(20, "NESNET V1.9.2", 2, 0xFFFFD040);
     if (l1) ui_center(90, l1, 1, 0xFFFFFFFF);
     if (l2) ui_center(110, l2, 1, 0xFFC0C0FF);
     if (l3) ui_center(130, l3, 1, 0xFFC0C0FF);
@@ -2962,8 +3241,10 @@ static void fit_name(char *dst, size_t cap, const char *src, int maxc)
     if (maxc >= 3) { dst[maxc - 3] = '.'; dst[maxc - 2] = '.'; dst[maxc - 1] = '.'; }
 }
 
-/* Selector de ROM: lista de USRDIR/roms. 1 = eligio y cargo una ROM, 0 = volvio sin elegir */
-static int ui_rom_select(void)
+/* Selector de ROM: lista de USRDIR/roms. 1 = eligio y cargo una ROM, 0 = volvio sin elegir.
+ * v1.9.2: con pick_only = 1 (el host en plena partida online) NO carga nada: deja nombre, CRC32 y tamano de la ROM elegida
+ * en g_pick_* y devuelve 1; la partida sigue en marcha por debajo (ver gsw_ask_host). */
+static int ui_rom_select(int pick_only)
 {
     enum { VIS = 9 };
     int sel = 0, top = 0, i, last_sel = -1, hold = 0;
@@ -2974,6 +3255,7 @@ static int ui_rom_select(void)
         uint16_t e;
         char line[64], nm[48];
         pump();
+        ui_keepalive();
         e = ui_edges();
         if (e & UI_CANCEL) return 0;
         if (g_nroms > 0) {
@@ -2981,7 +3263,19 @@ static int ui_rom_select(void)
             if (e & UI_DOWN)  sel = (sel + 1) % g_nroms;
             if (e & UI_LEFT)  sel = sel - 10 < 0 ? 0 : sel - 10;
             if (e & UI_RIGHT) sel = sel + 10 >= g_nroms ? g_nroms - 1 : sel + 10;
-            if (e & (UI_OK | UI_START)) {
+            if ((e & (UI_OK | UI_START)) && pick_only) {
+                uint8_t *b = NULL;
+                size_t bs = 0;
+                char rp[420];
+                snprintf(rp, sizeof rp, "%s/roms/%s", g_dir, g_roms[sel].name);
+                if (read_whole_file(rp, &b, &bs)) {
+                    g_pick_crc = crc32_buf(b, bs); g_pick_size = (uint32_t)bs;
+                    snprintf(g_pick_name, sizeof g_pick_name, "%s", g_roms[sel].name);
+                    free(b);
+                    return 1;
+                }
+                ui_message("NO PUDE LEER LA ROM", g_roms[sel].name, 300);
+            } else if (e & (UI_OK | UI_START)) {
                 ui_show("CARGANDO ROM...", g_roms[sel].name, NULL);
                 if (rom_load(sel)) {
                     snprintf(g_last_rom, sizeof g_last_rom, "%s", g_rom_name);     /* v1.9: la recuerda para la proxima vez */
@@ -3227,9 +3521,79 @@ static void ui_opt_netinfo(void)
     logf_("opciones: info de red = %d", g_netinfo);
 }
 
+/* v1.9.2: OPCIONES > AJUSTE DE IMAGEN: tamano (70 a 100 %) y desplazamiento horizontal / vertical (de 2 en 2 pixeles de la TV).
+ * La imagen cambia en vivo; el marco blanco es el borde del lienzo: hay que ajustar hasta verlo entero en la TV. */
+static void img_clamp(void)
+{
+    if (g_img_size < IMG_SIZE_MIN) g_img_size = IMG_SIZE_MIN;
+    if (g_img_size > 100) g_img_size = 100;
+    if (g_img_dx < -IMG_SHIFT_MAX) g_img_dx = -IMG_SHIFT_MAX;
+    if (g_img_dx > IMG_SHIFT_MAX) g_img_dx = IMG_SHIFT_MAX;
+    if (g_img_dy < -IMG_SHIFT_MAX) g_img_dy = -IMG_SHIFT_MAX;
+    if (g_img_dy > IMG_SHIFT_MAX) g_img_dy = IMG_SHIFT_MAX;
+}
+
+static void ui_opt_image(void)
+{
+    int sel = 0, i, x, y;
+    g_stage = "opciones-imagen";
+    ui_prime();
+    while (g_running) {
+        uint16_t e;
+        char line[48];
+        pump();
+        e = ui_edges();
+        if (e & UI_UP)   sel = (sel + 4) % 5;
+        if (e & UI_DOWN) sel = (sel + 1) % 5;
+        if (e & UI_CANCEL) break;
+        if (sel <= 2 && (e & (UI_LEFT | UI_RIGHT))) {
+            int dir = (e & UI_RIGHT) ? 1 : -1;
+            if (sel == 0) g_img_size += dir;
+            else if (sel == 1) g_img_dx += 2 * dir;
+            else g_img_dy += 2 * dir;
+            img_clamp();
+            opts_save();
+        }
+        if (e & (UI_OK | UI_START)) {
+            if (sel == 3) { g_img_size = 100; g_img_dx = 0; g_img_dy = 0; opts_save(); }
+            else if (sel == 4) break;
+        }
+        ui_clear();
+        ui_center(20, "AJUSTE DE IMAGEN", 2, 0xFFFFD040);
+        for (i = 0; i < 5; i++) {
+            uint32_t col = i == sel ? 0xFFFFFFFF : 0xFF8080A0;
+            if (i == 0)      snprintf(line, sizeof line, "%s TAMANO          %d%%", i == sel ? ">" : " ", g_img_size);
+            else if (i == 1) snprintf(line, sizeof line, "%s HORIZONTAL    %+d", i == sel ? ">" : " ", g_img_dx);
+            else if (i == 2) snprintf(line, sizeof line, "%s VERTICAL      %+d", i == sel ? ">" : " ", g_img_dy);
+            else             snprintf(line, sizeof line, "%s %s", i == sel ? ">" : " ", i == 3 ? "RESTAURAR (100%, 0, 0)" : "VOLVER");
+            ui_text(40, 56 + i * 16, line, 1, col);
+        }
+        ui_center(150, "IZQ/DER: CAMBIAR   ARRIBA/ABAJO: FILA", 1, 0xFFC0C0FF);
+        ui_center(166, "AJUSTA HASTA VER EL MARCO BLANCO ENTERO", 1, 0xFF80FF80);
+        ui_center(180, "(ES EL BORDE DE LA IMAGEN)", 1, 0xFF80FF80);
+        if (!g_cfg.render) ui_center(196, "AVISO: EL MODO GPU NO USA ESTO", 1, 0xFFFFC040);
+        ui_center(212, "O: VOLVER", 1, 0xFF8080A0);
+        /* marco blanco en el borde del lienzo, con una marca en cada esquina y en el centro de cada lado */
+        for (x = 0; x < SCR_W; x++) { g_fb[x] = 0xFFFFFFFF; g_fb[(SCR_H - 1) * SCR_W + x] = 0xFFFFFFFF; }
+        for (y = 0; y < SCR_H; y++) { g_fb[y * SCR_W] = 0xFFFFFFFF; g_fb[y * SCR_W + SCR_W - 1] = 0xFFFFFFFF; }
+        for (i = 0; i < 8; i++) {
+            g_fb[(1 + i) * SCR_W + 1] = 0xFFFF4040; g_fb[(1 + i) * SCR_W + SCR_W - 2] = 0xFFFF4040;
+            g_fb[(SCR_H - 2 - i) * SCR_W + 1] = 0xFFFF4040; g_fb[(SCR_H - 2 - i) * SCR_W + SCR_W - 2] = 0xFFFF4040;
+            g_fb[SCR_W + 1 + i] = 0xFFFF4040; g_fb[SCR_W + SCR_W - 2 - i] = 0xFFFF4040;
+            g_fb[(SCR_H - 2) * SCR_W + 1 + i] = 0xFFFF4040; g_fb[(SCR_H - 2) * SCR_W + SCR_W - 2 - i] = 0xFFFF4040;
+        }
+        present();
+#ifdef NESNET_HOST
+        sleep_ms(16);
+#endif
+    }
+    logf_("opciones: imagen = %d%% %+d %+d", g_img_size, g_img_dx, g_img_dy);
+}
+
 static void ui_options(void)
 {
-    static const char *items[5] = { "PANTALLA", "MANDOS (BOTONES Y TURBO)", "SONIDO (VOLUMEN)", "INFO DE RED EN PARTIDA", "VOLVER" };
+    enum { N_OPT = 7 };
+    static const char *items[N_OPT] = { "PANTALLA", "MANDOS (BOTONES Y TURBO)", "SONIDO (VOLUMEN)", "INFO DE RED EN PARTIDA", "AJUSTE DE IMAGEN", "", "VOLVER" };
     int sel = 0, i;
     g_stage = "opciones";
     ui_prime();
@@ -3237,23 +3601,26 @@ static void ui_options(void)
         uint16_t e;
         pump();
         e = ui_edges();
-        if (e & UI_UP)   sel = (sel + 4) % 5;
-        if (e & UI_DOWN) sel = (sel + 1) % 5;
+        if (e & UI_UP)   sel = (sel + N_OPT - 1) % N_OPT;
+        if (e & UI_DOWN) sel = (sel + 1) % N_OPT;
         if (e & UI_CANCEL) break;
-        if (e & (UI_OK | UI_START)) {
+        if (sel == 5 && (e & (UI_OK | UI_START | UI_LEFT | UI_RIGHT))) { g_showfps = !g_showfps; opts_save(); }   /* FPS: se prende y apaga en esta misma fila */
+        else if (e & (UI_OK | UI_START)) {
             if (sel == 0) { ui_opt_screen(); ui_prime(); g_stage = "opciones"; }
             else if (sel == 1) { ui_opt_pads(); ui_prime(); g_stage = "opciones"; }
             else if (sel == 2) { ui_opt_sound(); ui_prime(); g_stage = "opciones"; }
             else if (sel == 3) { ui_opt_netinfo(); ui_prime(); g_stage = "opciones"; }
+            else if (sel == 4) { ui_opt_image(); ui_prime(); g_stage = "opciones"; }
             else break;
         }
         ui_clear();
         ui_center(20, "OPCIONES", 2, 0xFFFFD040);
         ui_center(46, "SE GUARDAN SOLAS", 1, 0xFFC0C0FF);
-        for (i = 0; i < 5; i++) {
-            char line[40];
-            snprintf(line, sizeof line, "%s %s", i == sel ? ">" : " ", items[i]);
-            ui_center(76 + i * 20, line, 1, i == sel ? 0xFFFFFFFF : 0xFF8080A0);
+        for (i = 0; i < N_OPT; i++) {
+            char line[48];
+            if (i == 5) snprintf(line, sizeof line, "%s FPS EN PANTALLA: %s", i == sel ? ">" : " ", g_showfps ? "SI" : "NO");
+            else snprintf(line, sizeof line, "%s %s", i == sel ? ">" : " ", items[i]);
+            ui_center(66 + i * 18, line, 1, i == sel ? 0xFFFFFFFF : 0xFF8080A0);
         }
         ui_center(200, "ARRIBA/ABAJO + X", 1, 0xFF8080A0);
         ui_center(214, "O: VOLVER", 1, 0xFF8080A0);
@@ -3284,7 +3651,7 @@ static int ui_menu(void)
             else return modes[g_menu_sel];
         }
         ui_clear();
-        ui_center(20, "NESNET V1.9.1", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.2", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         if (g_rom) {
             fit_name(nm, sizeof nm, g_rom_name, 34);
@@ -3326,7 +3693,7 @@ static int ui_menu4(void)
         if (e & UI_CANCEL) return -1;
         if (e & (UI_OK | UI_START)) return sel == 0 ? MODE_HOST : sel == 1 ? MODE_JOIN : -1;
         ui_clear();
-        ui_center(20, "NESNET V1.9.1", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.2", 2, 0xFFFFD040);
         ui_center(46, "MULTIJUGADOR DE 4 (FOUR SCORE)", 1, 0xFFC0C0FF);
         ui_center(66, "HOST: MANDOS 1 Y 2", 1, 0xFF80FF80);
         ui_center(80, "EL QUE SE UNE: MANDOS 3 Y 4", 1, 0xFF80FF80);
@@ -3365,7 +3732,7 @@ static int ui_enter_code(char *out)
             return 1;
         }
         ui_clear();
-        ui_center(20, "NESNET V1.9.1", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.2", 2, 0xFFFFD040);
         ui_center(60, "ESCRIBE EL CODIGO DEL HOST", 1, 0xFFFFFFFF);
         for (i = 0; i < 10; i++) {
             char c[2] = { (char)('0' + d[i]), 0 };
@@ -3397,9 +3764,15 @@ static void net_close(void)
 static int run_online(int is_host, int D)
 {
     int ok;
-    if (!core_load()) return 0;
-    ok = session_loop(is_host ? 0 : 1, D, g_maxframes);
-    core_unload();
+    for (;;) {
+        if (!core_load()) { net_close(); return 0; }
+        ok = session_loop(is_host ? 0 : 1, D, g_maxframes);
+        core_unload();
+        if (!g_sw_pending) break;
+        /* v1.9.2: cambio de juego: marca de fin, ROM nueva y otra sesion con el mismo delay (sin repetir el handshake) */
+        g_sw_pending = 0;
+        if (!game_switch_apply()) { ok = 0; break; }
+    }
     net_close();
     return ok;
 }
@@ -3460,7 +3833,7 @@ static int run_host_inner(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.9.1", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.2", 2, 0xFFFFD040);
         ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
         { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -3537,9 +3910,14 @@ static int run_online4(int is_host, int D)
 {
     int ok;
     g_four = 1;
-    if (!core_load4()) { g_four = 0; return 0; }
-    ok = session_loop4(is_host ? 0 : 1, D, g_maxframes);
-    core_unload();
+    for (;;) {
+        if (!core_load4()) { g_four = 0; net_close(); return 0; }
+        ok = session_loop4(is_host ? 0 : 1, D, g_maxframes);
+        core_unload();
+        if (!g_sw_pending) break;
+        g_sw_pending = 0;                                  /* v1.9.2: cambio de juego (igual que en el 1vs1) */
+        if (!game_switch_apply()) { ok = 0; break; }
+    }
     g_four = 0;
     net_close();
     return ok;
@@ -3601,7 +3979,7 @@ static int run_host4_inner(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.9.1", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.2", 2, 0xFFFFD040);
         ui_center(64, "SALA DE 4 - TU CODIGO:", 1, 0xFFFFFFFF);
         { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -3739,7 +4117,7 @@ static int app_main(const char *argv0)
         if (choice < 0) choice = ui_menu();
         if (choice < 0) break;
         if (choice == MODE_ROM) {
-            if (ui_rom_select()) g_menu_sel = 1;          /* tras elegir, el cursor pasa a CREAR SALA */
+            if (ui_rom_select(0)) g_menu_sel = 1;          /* tras elegir, el cursor pasa a CREAR SALA */
             choice = -1;
             continue;
         }
@@ -3835,7 +4213,7 @@ int main(int argc, char **argv)
         static const char *items[3] = { "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS" };
         int i;
         ui_clear();
-        ui_center(20, "NESNET V1.9.1", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.2", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         for (i = 0; i < 3; i++) {
             char line[40];
@@ -3847,7 +4225,7 @@ int main(int argc, char **argv)
             char code[20];
             code_encode(((uint32_t)181 << 24) | (45u << 16) | (200u << 8) | 17u, 7777, code);
             ui_clear();
-            ui_center(20, "NESNET V1.9.1", 2, 0xFFFFD040);
+            ui_center(20, "NESNET V1.9.2", 2, 0xFFFFD040);
             ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
             { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
             ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -3868,6 +4246,7 @@ int main(int argc, char **argv)
     if (getenv("NESNET_R2")) g_exit_at = (uint32_t)atoi(getenv("NESNET_R2"));
     if (getenv("NESNET_R2B")) g_exit_at2 = (uint32_t)atoi(getenv("NESNET_R2B"));
     if (getenv("NESNET_NETINFO")) g_netinfo = atoi(getenv("NESNET_NETINFO"));   /* prueba: modo de info de red */
+    if (getenv("NESNET_FPS")) g_showfps = atoi(getenv("NESNET_FPS"));           /* prueba v1.9.2: FPS en pantalla */
     if (getenv("NESNET_RESET_REF")) {                                            /* prueba v1.9.1: reinicios de la referencia "a" o "a,b" */
         const char *rr = getenv("NESNET_RESET_REF");
         g_ref_reset[0] = (uint32_t)atoi(rr);
@@ -3891,6 +4270,7 @@ int main(int argc, char **argv)
     if (!read_whole_file(argv[1], &g_rom, &g_romsz)) { fprintf(stderr, "no puedo leer la ROM\n"); return 2; }
     g_romcrc = crc32_buf(g_rom, g_romsz);
     snprintf(g_dir, sizeof g_dir, "/tmp");
+    if (getenv("NESNET_DIR")) snprintf(g_dir, sizeof g_dir, "%s", getenv("NESNET_DIR"));   /* prueba v1.9.2: carpeta propia (con roms/) por proceso */
     core_boot();
 
     if (!strcmp(mode, "local")) {
@@ -4068,6 +4448,91 @@ int main(int argc, char **argv)
             bad += sb;
         }
         printf("maptest TOTAL bad=%u\n", bad);
+        return bad != 0;
+    } else if (!strcmp(mode, "imgtest")) {
+        /* v1.9.2: ajuste de imagen (canvas_blit_adj) y guardado de las opciones nuevas */
+        static const int dims[4][3] = { { 1280, 720, 3 }, { 1920, 1080, 3 }, { 1920, 1080, 4 }, { 720, 480, 2 } };
+        static const int sizes[4] = { 100, 90, 80, 70 };
+        static const int shifts[7][2] = { { 0, 0 }, { 2, 0 }, { 0, -2 }, { 60, 60 }, { -60, -60 }, { 60, -60 }, { -60, 60 } };
+        static uint32_t fbuf[SCR_W * SCR_H], b0[1920 * 1080], b1[1920 * 1080], ref[1920 * 1080];
+        unsigned bad = 0, ncheck = 0;
+        int di, md, si, hi, x, y;
+        for (y = 0; y < SCR_H; y++) for (x = 0; x < SCR_W; x++) fbuf[y * SCR_W + x] = 0xFF000000u | ((uint32_t)y << 8) | (uint32_t)x;
+        for (di = 0; di < 4; di++) {
+            int dw = dims[di][0], dh = dims[di][1], z = dims[di][2];
+            for (md = 0; md < 3; md++) {
+                /* 1) con 100 %, 0, 0 es IDENTICO a canvas_blit_cpu (lo que se usaba hasta la v1.9.1) */
+                {
+                    unsigned fa = 0, fb = 0;
+                    size_t i;
+                    for (i = 0; i < (size_t)dw * dh; i++) { b0[i] = 0xDEADBEEFu; b1[i] = 0xDEADBEEFu; }
+                    canvas_blit_cpu(b0, dw, dh, md, z, fbuf, &fa);
+                    canvas_blit_adj(b1, dw, dh, md, z, fbuf, &fb, 100, 0, 0);
+                    ncheck++;
+                    if (memcmp(b0, b1, (size_t)dw * dh * 4)) { bad++; printf("imgtest %dx%d modo=%d: 100%%,0,0 DIFIERE de canvas_blit_cpu\n", dw, dh, md); }
+                }
+                /* 2) cada tamano y desplazamiento contra el calculo pixel a pixel (con recorte), en dos buffers alternados
+                 *    como en la PS3: tras cambiar la geometria, a las 2 llamadas (una por buffer) no queda ningun resto */
+                for (si = 0; si < 4; si++)
+                    for (hi = 0; hi < 7; hi++) {
+                        int oh0 = SCR_H * z, ow0 = screen_out_w(md, dw, oh0, z);
+                        int ow = ow0 * sizes[si] / 100, oh = oh0 * sizes[si] / 100;
+                        int ox = (dw - ow) / 2 + shifts[hi][0], oy = (dh - oh) / 2 + shifts[hi][1];
+                        unsigned fa = 0, fb = 0;
+                        int k, errs = 0, dx, dy;
+                        size_t i;
+                        /* historia previa con OTRA geometria, para que haya restos que borrar */
+                        for (i = 0; i < (size_t)dw * dh; i++) { b0[i] = 0xDEADBEEFu; b1[i] = 0xDEADBEEFu; }
+                        canvas_blit_adj(b0, dw, dh, md, z, fbuf, &fa, 100, 0, 0);
+                        canvas_blit_adj(b1, dw, dh, md, z, fbuf, &fb, 100, 0, 0);
+                        for (k = 0; k < 4; k++) { canvas_blit_adj(b0, dw, dh, md, z, fbuf, &fa, 100, 0, 0); canvas_blit_adj(b1, dw, dh, md, z, fbuf, &fb, 100, 0, 0); }
+                        for (k = 0; k < 2; k++) {          /* geometria nueva: una llamada por buffer */
+                            canvas_blit_adj(b0, dw, dh, md, z, fbuf, &fa, sizes[si], shifts[hi][0], shifts[hi][1]);
+                            canvas_blit_adj(b1, dw, dh, md, z, fbuf, &fb, sizes[si], shifts[hi][0], shifts[hi][1]);
+                        }
+                        for (dy = 0; dy < dh; dy++)
+                            for (dx = 0; dx < dw; dx++) {
+                                uint32_t want = 0;
+                                if (dy >= oy && dy < oy + oh && dx >= ox && dx < ox + ow)
+                                    want = fbuf[((dy - oy) * SCR_H / oh) * SCR_W + ((dx - ox) * SCR_W / ow)];
+                                ref[(size_t)dy * dw + dx] = want;
+                            }
+                        for (i = 0; i < (size_t)dw * dh; i++) if (b0[i] != ref[i]) errs++;
+                        for (i = 0; i < (size_t)dw * dh; i++) if (b1[i] != ref[i]) errs++;
+                        ncheck++;
+                        if (errs) { bad++; printf("imgtest %dx%d modo=%d tam=%d%% dx=%d dy=%d: %d pixeles mal\n", dw, dh, md, sizes[si], shifts[hi][0], shifts[hi][1], errs); }
+                    }
+            }
+        }
+        printf("imgtest imagen: %u comprobaciones, mal=%u\n", ncheck, bad);
+        /* 3) las opciones nuevas se guardan y se leen (y valores fuera de rango o basura se ignoran) */
+        {
+            unsigned ob = 0;
+            FILE *f;
+            char p[300];
+            snprintf(g_dir, sizeof g_dir, "/tmp/nn_img_test");
+            { char cmd[320]; snprintf(cmd, sizeof cmd, "mkdir -p %s", g_dir); if (system(cmd)) ob++; }
+            opts_defaults();
+            if (g_showfps != 0 || g_img_size != 100 || g_img_dx != 0 || g_img_dy != 0) ob++;              /* valores de siempre por defecto */
+            g_showfps = 1; g_img_size = 85; g_img_dx = -14; g_img_dy = 30;
+            opts_save();
+            opts_defaults();
+            opts_load();
+            if (g_showfps != 1 || g_img_size != 85 || g_img_dx != -14 || g_img_dy != 30) { ob++; printf("imgtest opciones: NO se leyeron bien (fps=%d size=%d dx=%d dy=%d)\n", g_showfps, g_img_size, g_img_dx, g_img_dy); }
+            snprintf(p, sizeof p, "%s/opciones.txt", g_dir);
+            f = fopen(p, "wb");
+            if (f) { fprintf(f, "fps=7\nimgsize=5\nimgx=9999\nimgy=-9999\n"); fclose(f); }
+            opts_defaults();
+            opts_load();
+            if (g_showfps != 0 || g_img_size != 100 || g_img_dx != 0 || g_img_dy != 0) { ob++; printf("imgtest opciones: valores malos NO se ignoraron\n"); }
+            remove(p);
+            opts_defaults();
+            opts_load();                                                      /* sin archivo: valores de siempre */
+            if (g_showfps != 0 || g_img_size != 100 || g_img_dx != 0 || g_img_dy != 0) ob++;
+            printf("imgtest opciones: mal=%u\n", ob);
+            bad += ob;
+        }
+        printf("imgtest TOTAL mal=%u\n", bad);
         return bad != 0;
     } else if (!strcmp(mode, "screentest")) {
         /* v1.8.2: pruebas del escalado de pantalla (canvas_blit_cpu, la misma funcion que usa la PS3) */
