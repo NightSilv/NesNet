@@ -3,8 +3,9 @@
  *   PSL1GHT + nucleo libretro FCEUmm
  *
  * Netplay: lockstep con retraso fijo (delay) sobre TCP, 2 jugadores.
- *   - El host crea la sala y recibe un CODIGO NUMERICO (15 digitos) que codifica
- *     su IP publica y puerto. El cliente escribe ese codigo con el mando.
+ *   - El host crea la sala y recibe un CODIGO NUMERICO (10 digitos) que codifica
+ *     su IP publica (el puerto es el de config.txt, 7777 por defecto, igual en los dos).
+ *     El cliente escribe ese codigo con el mando.
  *   - Sin servidor: conexion directa host <-> cliente.
  *
  * Se compila de 2 formas:
@@ -62,7 +63,9 @@ int closesocket(int s);      /* definida en libnet, pero sin prototipo en las ca
 /* ------------------------------------------------------------------ */
 /* Constantes                                                          */
 /* ------------------------------------------------------------------ */
-#define PROTO_VER      1
+/* v1.9.1: el mensaje M_RESET (reinicio sincronizado desde el menu R2) cambia el protocolo: una v1.9.1 y una v1.9
+ * se rechazan entre si con el aviso "VERSIONES DISTINTAS DE NESNET" en vez de desincronizarse. */
+#define PROTO_VER      3
 #define DEFAULT_PORT   7777
 #define SCR_W          256
 #define SCR_H          240
@@ -79,8 +82,8 @@ int closesocket(int s);      /* definida en libnet, pero sin prototipo en las ca
 #define MODE_OPT       5      /* v1.8.2: opcion "OPCIONES" del menu (pantalla y mandos; no es un modo de juego) */
 
 /* v1.8: el modo de 4 jugadores es una COPIA aparte del 1vs1 y habla otro protocolo, asi un host de 1vs1
- * nunca acepta a alguien del modo de 4 (ni al reves). El 1vs1 sigue con PROTO_VER 1, igual que la v1.7. */
-#define PROTO_VER4     2
+ * nunca acepta a alguien del modo de 4 (ni al reves). Desde la v1.9.1: 1vs1 = 3, modo de 4 = 4. */
+#define PROTO_VER4     4
 
 /* FCEUmm define su "GAMEPAD" como subclase 1 del mando (RETRO_DEVICE_GAMEPAD en su libretro.c) */
 #define NES_DEV_GAMEPAD RETRO_DEVICE_SUBCLASS(RETRO_DEVICE_JOYPAD, 1)
@@ -1258,6 +1261,7 @@ static void net_ensure(void) {}
 static const char *g_ui_script = "";
 static int g_ui_has_script;
 static uint32_t g_exit_at = 0xFFFFFFFEu;   /* prueba: frame en el que "se aprieta R2" (NESNET_R2) */
+static uint32_t g_exit_at2 = 0xFFFFFFFEu;  /* prueba v1.9.1: segundo R2 (NESNET_R2B) */
 static uint16_t ui_edges(void)
 {
     char c = *g_ui_script;
@@ -1276,7 +1280,7 @@ static uint16_t ui_edges(void)
 }
 static uint16_t pad_nes_bits(int port) { (void)port; return 0; }
 static void ui_prime(void) {}
-static int exit_pressed(int prime, uint32_t frame) { return !prime && frame == g_exit_at; }
+static int exit_pressed(int prime, uint32_t frame) { return !prime && (frame == g_exit_at || frame == g_exit_at2); }
 
 /* Capturas de prueba: NESNET_SHOTDIR=carpeta NESNET_SHOTS=3,40,90 (numeros de present()) */
 static void dump_ppm(const char *path);
@@ -1645,6 +1649,81 @@ static void sram_save(int force)
     logf_("guardado: escrito %s (%u bytes)", path, (unsigned)n);
 }
 
+/* ------------------------------------------------------------------ */
+/* v1.9.1: estados guardados (savestates) - SOLO en el modo SOLO         */
+/* Archivo: USRDIR/saves/<CRC32 de la ROM>_<ranura 1..3>.sta. En online NO existen (las dos consolas tendrian que     */
+/* cargar el mismo estado a la vez y se desincronizarian).                                                         */
+/* ------------------------------------------------------------------ */
+#define STATE_SLOTS 3
+#define STATE_MAX   0x200000
+static int  g_state_slot;                 /* ranura elegida en el menu (0..2); se recuerda mientras la app esta abierta */
+static char g_toast[48];                  /* aviso corto sobre la imagen (guardado, cargado, error) */
+static int  g_toast_n;
+
+static void toast(const char *s) { snprintf(g_toast, sizeof g_toast, "%s", s); g_toast_n = 150; }
+
+static void state_path(int slot, char *out, size_t cap)
+{
+    snprintf(out, cap, "%s/saves/%08X_%d.sta", g_dir, (unsigned)g_romcrc, slot + 1);
+}
+
+static int state_exists(int slot)
+{
+    char path[420];
+    FILE *f;
+    state_path(slot, path, sizeof path);
+    f = fopen(path, "rb");
+    if (!f) return 0;
+    fclose(f);
+    return 1;
+}
+
+static int state_save(int slot)
+{
+    size_t n = retro_serialize_size();
+    uint8_t *buf;
+    char dir[320], path[420], tmp[440];
+    FILE *f;
+    int ok;
+    if (n == 0 || n > STATE_MAX) { logf_("AVISO: estado: el nucleo pide %u bytes (no valido)", (unsigned)n); return 0; }
+    buf = (uint8_t *)malloc(n);
+    if (!buf) { logf_("AVISO: estado: sin memoria para %u bytes", (unsigned)n); return 0; }
+    if (!retro_serialize(buf, n)) { free(buf); logf_("AVISO: estado: el nucleo no pudo guardar"); return 0; }
+    snprintf(dir, sizeof dir, "%s/saves", g_dir);
+    mkdir(dir, 0777);
+    state_path(slot, path, sizeof path);
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    f = fopen(tmp, "wb");
+    if (!f) { free(buf); logf_("AVISO: no pude crear %s (errno=%d)", tmp, errno); return 0; }
+    ok = fwrite(buf, 1, n, f) == n;
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) { free(buf); remove(tmp); logf_("AVISO: no pude escribir el estado"); return 0; }
+    remove(path);
+    if (rename(tmp, path) != 0) { free(buf); logf_("AVISO: no pude renombrar el estado (queda %s)", tmp); return 0; }
+    logf_("estado: guardado ranura %d (%u bytes, crc %08X)", slot + 1, (unsigned)n, (unsigned)crc32_buf(buf, n));
+    free(buf);
+    return 1;
+}
+
+static int state_load(int slot)
+{
+    size_t n = retro_serialize_size(), fsz = 0;
+    uint8_t *buf = NULL;
+    char path[420];
+    int ok;
+    state_path(slot, path, sizeof path);
+    if (!read_whole_file(path, &buf, &fsz)) { logf_("estado: la ranura %d esta vacia", slot + 1); return -1; }
+    if (fsz != n) {
+        free(buf);
+        logf_("AVISO: estado: la ranura %d tiene %u bytes y el nucleo pide %u: no la cargo", slot + 1, (unsigned)fsz, (unsigned)n);
+        return 0;
+    }
+    ok = retro_unserialize(buf, fsz) ? 1 : 0;
+    logf_("estado: cargada ranura %d (%u bytes, crc %08X) %s", slot + 1, (unsigned)fsz, (unsigned)crc32_buf(buf, fsz), ok ? "OK" : "FALLO");
+    free(buf);
+    return ok;
+}
+
 static void step_frame(uint16_t p1, uint16_t p2)
 {
     g_pad[0] = p1;
@@ -1665,7 +1744,7 @@ static void step_frame4(uint16_t p1, uint16_t p2, uint16_t p3, uint16_t p4)
 /* ------------------------------------------------------------------ */
 /* Red: mensajes de 16 bytes, TCP, poll() con espera propia            */
 /* ------------------------------------------------------------------ */
-enum { M_HELLO = 1, M_PING, M_PONG, M_CFG, M_START, M_INPUT, M_QUIT, M_REJECT };
+enum { M_HELLO = 1, M_PING, M_PONG, M_CFG, M_START, M_INPUT, M_QUIT, M_REJECT, M_RESET };   /* v1.9.1: M_RESET (frame = cuadro en que ambos reinician) */
 
 typedef struct {
     uint8_t  type, a;
@@ -2120,13 +2199,15 @@ static void upnp_close(void)
     logf_("upnp: regla del puerto %d quitada del router (error=%d)", g_upnp_port, err);
 }
 
-/* Codigo = (IP << 16 | puerto) en decimal de 15 digitos */
+/* v1.9.1: Codigo = IP publica del host como numero, en decimal de 10 digitos (con ceros a la izquierda).
+ * El puerto ya NO viaja en el codigo: los dos usan el de config.txt (7777 por defecto). */
 static void code_encode(uint32_t ip, int port, char *out)
 {
-    uint64_t v = ((uint64_t)ip << 16) | (uint64_t)(port & 0xFFFF);
+    uint32_t v = ip;
     int i;
-    for (i = 14; i >= 0; i--) { out[i] = (char)('0' + (int)(v % 10)); v /= 10; }
-    out[15] = 0;
+    (void)port;
+    for (i = 9; i >= 0; i--) { out[i] = (char)('0' + (int)(v % 10)); v /= 10; }
+    out[10] = 0;
 }
 
 static int code_decode(const char *code, uint32_t *ip, int *port)
@@ -2137,11 +2218,23 @@ static int code_decode(const char *code, uint32_t *ip, int *port)
         if (code[i] < '0' || code[i] > '9') continue;     /* ignora espacios y guiones */
         v = v * 10 + (uint64_t)(code[i] - '0');
         n++;
+        if (n > 10) return 0;
     }
-    if (n < 10 || n > 15 || v >= (1ULL << 48)) return 0;
-    *ip = (uint32_t)(v >> 16);
-    *port = (int)(v & 0xFFFF);
+    if (n != 10 || v >= (1ULL << 32)) return 0;
+    *ip = (uint32_t)v;
+    *port = g_cfg.port;
     return *port > 0 && *ip != 0;
+}
+
+/* "1234567890" -> "123 456 7890" (solo para mostrarlo en pantalla) */
+static void code_pretty(const char *code, char *out)
+{
+    int i, k = 0;
+    for (i = 0; code[i] && i < 10; i++) {
+        if (i == 3 || i == 6) out[k++] = ' ';
+        out[k++] = code[i];
+    }
+    out[k] = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -2321,6 +2414,7 @@ static uint16_t local_bits(int port, int slot, uint32_t frame)
  * Dibuja encima de la imagen del juego y la restaura al cerrar. */
 static uint32_t g_fb_save[SCR_W * SCR_H];
 
+static int exit_menu(int online) __attribute__((unused));
 static int exit_menu(int online)
 {
     int r = -1, x, y;
@@ -2349,43 +2443,94 @@ static int exit_menu(int online)
     return r == 1;
 }
 
-/* v1.9: menu de R2 SOLO para el modo SOLO: CONTINUAR / REINICIAR / SALIR (reiniciar y salir piden confirmar con X).
- * En online se sigue usando exit_menu() de arriba, sin cambios. Devuelve 0 = seguir jugando, 1 = salir, 2 = reiniciar el juego. */
-static int solo_menu(void)
+enum { MK_CONT, MK_SAVE, MK_LOAD, MK_RESET, MK_EXIT };
+
+/* v1.9.1: menu de R2.
+ *   SOLO:   CONTINUAR / GUARDAR ESTADO / CARGAR ESTADO / REINICIAR EL JUEGO / SALIR DE LA PARTIDA
+ *   ONLINE: CONTINUAR / REINICIAR EL JUEGO / SALIR DE LA PARTIDA (reiniciar y salir valen para los dos; sin estados)
+ * Reiniciar, salir, cargar y sobreescribir piden confirmar con X.
+ * Devuelve 0 = seguir jugando, 1 = salir, 2 = reiniciar, 10+n = guardar en la ranura n, 20+n = cargar la ranura n (n = 0..2). */
+static int solo_menu(int online)
 {
-    static const char *items[3] = { "CONTINUAR", "REINICIAR EL JUEGO", "SALIR DE LA PARTIDA" };
-    int sel = 0, r = -1, confirm = 0, x, y, i;
+    int kinds[5], nk = 0, sel = 0, r = -1, confirm = -1, x, y, i;
+    int ex[STATE_SLOTS];
+    const char *note = NULL;
+    kinds[nk++] = MK_CONT;
+    if (!online) { kinds[nk++] = MK_SAVE; kinds[nk++] = MK_LOAD; }
+    kinds[nk++] = MK_RESET; kinds[nk++] = MK_EXIT;
+    for (i = 0; i < STATE_SLOTS; i++) ex[i] = online ? 0 : state_exists(i);
     memcpy(g_fb_save, g_fb, sizeof g_fb);
     g_stage = "menu-solo";
     ui_prime();
     while (g_running && r < 0) {
         uint16_t e;
+        int k;
         pump();
         e = ui_edges();
-        if (confirm) {
-            if (e & UI_OK) r = confirm == 1 ? 2 : 1;
-            else if (e & UI_CANCEL) confirm = 0;
+        if (confirm >= 0) {
+            if (e & UI_OK) {
+                if (confirm == MK_RESET) r = 2;
+                else if (confirm == MK_EXIT) r = 1;
+                else if (confirm == MK_SAVE) r = 10 + g_state_slot;
+                else r = 20 + g_state_slot;
+            } else if (e & UI_CANCEL) confirm = -1;
         } else {
-            if (e & UI_UP)   sel = (sel + 2) % 3;
-            if (e & UI_DOWN) sel = (sel + 1) % 3;
-            if (e & UI_CANCEL) r = 0;
-            else if (e & (UI_OK | UI_START)) { if (sel == 0) r = 0; else confirm = sel; }
-        }
-        for (y = 62; y < 178; y++)
-            for (x = 20; x < 236; x++)
-                g_fb[y * SCR_W + x] = (y < 64 || y >= 176 || x < 22 || x >= 234) ? 0xFFFFFFFF : 0xFF101838;
-        if (confirm) {
-            ui_center(94, confirm == 1 ? "REINICIAR EL JUEGO?" : "SALIR DE LA PARTIDA?", 1, 0xFFFFFFFF);
-            ui_center(120, "X: SI      O: NO", 1, 0xFFFFD040);
-            if (confirm == 1) ui_center(142, "LO GUARDADO NO SE BORRA", 1, 0xFFC0C0FF);
-        } else {
-            ui_center(72, "MENU", 1, 0xFFFFD040);
-            for (i = 0; i < 3; i++) {
-                char l[40];
-                snprintf(l, sizeof l, "%s %s", i == sel ? ">" : " ", items[i]);
-                ui_center(96 + i * 16, l, 1, i == sel ? 0xFFFFFFFF : 0xFF8080A0);
+            if (e & UI_UP)   { sel = (sel + nk - 1) % nk; note = NULL; }
+            if (e & UI_DOWN) { sel = (sel + 1) % nk; note = NULL; }
+            k = kinds[sel];
+            if ((k == MK_SAVE || k == MK_LOAD) && (e & (UI_LEFT | UI_RIGHT))) {
+                g_state_slot = (g_state_slot + ((e & UI_RIGHT) ? 1 : STATE_SLOTS - 1)) % STATE_SLOTS;
+                note = NULL;
             }
-            ui_center(154, "ARRIBA/ABAJO + X   O: SEGUIR", 1, 0xFF8080A0);
+            if (e & UI_CANCEL) r = 0;
+            else if (e & (UI_OK | UI_START)) {
+                if (k == MK_CONT) r = 0;
+                else if (k == MK_SAVE) { if (ex[g_state_slot]) confirm = MK_SAVE; else r = 10 + g_state_slot; }
+                else if (k == MK_LOAD) { if (ex[g_state_slot]) confirm = MK_LOAD; else note = "ESA RANURA ESTA VACIA"; }
+                else confirm = k;
+            }
+        }
+        for (y = 46; y < 198; y++)
+            for (x = 20; x < 236; x++)
+                g_fb[y * SCR_W + x] = (y < 48 || y >= 196 || x < 22 || x >= 234) ? 0xFFFFFFFF : 0xFF101838;
+        if (confirm >= 0) {
+            char l[40];
+            if (confirm == MK_RESET) {
+                ui_center(88, "REINICIAR EL JUEGO?", 1, 0xFFFFFFFF);
+                ui_center(108, online ? "SE REINICIA PARA LOS DOS" : "LO GUARDADO NO SE BORRA", 1, online ? 0xFFFFC040 : 0xFFC0C0FF);
+            } else if (confirm == MK_EXIT) {
+                ui_center(88, "SALIR DE LA PARTIDA?", 1, 0xFFFFFFFF);
+                if (online) ui_center(108, "TERMINA LA PARTIDA PARA LOS DOS", 1, 0xFFFFC040);
+            } else if (confirm == MK_SAVE) {
+                snprintf(l, sizeof l, "SOBREESCRIBIR LA RANURA %d?", g_state_slot + 1);
+                ui_center(88, l, 1, 0xFFFFFFFF);
+            } else {
+                snprintf(l, sizeof l, "CARGAR LA RANURA %d?", g_state_slot + 1);
+                ui_center(88, l, 1, 0xFFFFFFFF);
+                ui_center(108, "SE PIERDE LO QUE LLEVAS", 1, 0xFFFFC040);
+            }
+            ui_center(136, "X: SI      O: NO", 1, 0xFFFFD040);
+        } else {
+            ui_center(56, "MENU", 1, 0xFFFFD040);
+            for (i = 0; i < nk; i++) {
+                char l[48];
+                switch (kinds[i]) {
+                case MK_CONT:  snprintf(l, sizeof l, "%s", "CONTINUAR"); break;
+                case MK_SAVE:  snprintf(l, sizeof l, "GUARDAR ESTADO < %d >", g_state_slot + 1); break;
+                case MK_LOAD:  snprintf(l, sizeof l, "CARGAR ESTADO < %d >%s", g_state_slot + 1, ex[g_state_slot] ? "" : " (VACIA)"); break;
+                case MK_RESET: snprintf(l, sizeof l, "%s", "REINICIAR EL JUEGO"); break;
+                default:       snprintf(l, sizeof l, "%s", "SALIR DE LA PARTIDA"); break;
+                }
+                {
+                    char l2[56];
+                    snprintf(l2, sizeof l2, "%s %s", i == sel ? ">" : " ", l);
+                    ui_center(76 + i * 16, l2, 1, i == sel ? 0xFFFFFFFF : 0xFF8080A0);
+                }
+            }
+            if (note) ui_center(158, note, 1, 0xFFFFC040);
+            ui_center(172, "ARRIBA/ABAJO + X   O: SEGUIR", 1, 0xFF8080A0);
+            if (online) ui_center(184, "REINICIAR Y SALIR: PARA LOS DOS", 1, 0xFF8080A0);
+            else if (kinds[sel] == MK_SAVE || kinds[sel] == MK_LOAD) ui_center(184, "IZQ/DER: CAMBIAR DE RANURA", 1, 0xFF8080A0);
         }
         present();
 #ifdef NESNET_HOST
@@ -2423,17 +2568,39 @@ static int netinfo_show(uint32_t frame)
     return frame < 300;                      /* por defecto: como siempre, los primeros ~5 s */
 }
 
+/* v1.9.1: reinicios sincronizados. Quien pide reiniciar manda M_RESET con frame = F (= su cuadro actual + D) ANTES de su
+ * entrada de ese cuadro; por el orden del TCP el otro lado lo lee antes de poder pasar del cuadro F, asi los dos llaman a
+ * retro_reset() justo antes de emular el cuadro F. Si piden los dos a la vez, cada reinicio tiene su propio F. */
+#define RST_MAX 4
+static void rst_add(uint32_t *rst, uint32_t f)
+{
+    int k;
+    for (k = 0; k < RST_MAX; k++) if (rst[k] == f) return;
+    for (k = 0; k < RST_MAX; k++) if (rst[k] == NO_FRAME) { rst[k] = f; return; }
+}
+static int rst_due(uint32_t *rst, uint32_t frame)
+{
+    int k, due = 0;
+    for (k = 0; k < RST_MAX; k++) if (rst[k] == frame) { rst[k] = NO_FRAME; due = 1; }
+    return due;
+}
+#ifdef NESNET_HOST
+static uint32_t g_ref_reset[2] = { NO_FRAME, NO_FRAME };   /* pruebas: cuadros en que la referencia reinicia (NESNET_RESET_REF=a,b) */
+#endif
+
 static int session_loop(int role, int D, uint32_t maxframes)
 {
     uint16_t loc[RING], rem[RING];
     uint8_t  have[RING];
     uint32_t mine_f[RING], mine_c[RING], rem_f[RING], rem_c[RING];
     uint32_t frame = 0, last_rx = now_ms();
+    uint32_t rst[RST_MAX];
     int i, ended_ok = 1, peer_gone = 0, peer_quit = 0, user_exit = 0;
     char ov[64];
 
     memset(loc, 0, sizeof loc); memset(rem, 0, sizeof rem); memset(have, 0, sizeof have);
     for (i = 0; i < RING; i++) { mine_f[i] = NO_FRAME; rem_f[i] = NO_FRAME; mine_c[i] = rem_c[i] = 0; }
+    for (i = 0; i < RST_MAX; i++) rst[i] = NO_FRAME;
     if (role >= 0) for (i = 0; i < D; i++) have[i] = 1;
 
     g_run_hash = 2166136261u; g_frames_done = 0; g_desyncs = 0; g_first_desync = NO_FRAME;
@@ -2455,10 +2622,31 @@ static int session_loop(int role, int D, uint32_t maxframes)
         /* v1.7: R2 abre el menu de salir. Se mira antes de mandar la entrada de este frame; si sigue, el
          * otro lado simplemente espera como siempre. No cambia nada del protocolo ni del lockstep. */
         if (role != -2 && exit_pressed(0, frame)) {
-            /* v1.9: en SOLO (role -1) el menu es CONTINUAR / REINICIAR / SALIR; en online (role >= 0) es el de siempre */
-            int xr = role == -1 ? solo_menu() : (exit_menu(role >= 0) ? 1 : 0);
+            /* v1.9.1: SOLO = continuar / guardar y cargar estado / reiniciar / salir; online = continuar / reiniciar / salir */
+            int xr = solo_menu(role >= 0);
             if (xr == 1) { user_exit = 1; logf_("salida pedida por el jugador (R2) en frame %u", (unsigned)frame); goto out; }
-            if (xr == 2) { retro_reset(); logf_("juego reiniciado por el jugador (R2) en frame %u", (unsigned)frame); }
+            if (xr == 2) {
+                if (role >= 0) {
+                    Msg rq;
+                    uint32_t F = frame + (uint32_t)D;
+                    memset(&rq, 0, sizeof rq); rq.type = M_RESET; rq.frame = F;
+                    if (!peer_gone && !net_send(&rq)) peer_gone = 1;
+                    rst_add(rst, F);
+                    logf_("reinicio pedido por el jugador (R2) en frame %u: los dos reinician en el frame %u", (unsigned)frame, (unsigned)F);
+                } else {
+                    retro_reset();
+                    logf_("juego reiniciado por el jugador (R2) en frame %u", (unsigned)frame);
+                }
+            } else if (xr >= 10 && xr < 10 + STATE_SLOTS && role == -1) {
+                char tb[40];
+                snprintf(tb, sizeof tb, state_save(xr - 10) ? "ESTADO GUARDADO EN RANURA %d" : "NO SE PUDO GUARDAR (RANURA %d)", xr - 9);
+                toast(tb);
+            } else if (xr >= 20 && xr < 20 + STATE_SLOTS && role == -1) {
+                char tb[40];
+                int lr = state_load(xr - 20);
+                snprintf(tb, sizeof tb, lr > 0 ? "ESTADO CARGADO: RANURA %d" : "NO SE PUDO CARGAR (RANURA %d)", xr - 19);
+                toast(tb);
+            }
             last_rx = now_ms();
         }
 
@@ -2500,6 +2688,8 @@ static int session_loop(int role, int D, uint32_t maxframes)
                     rem[m.frame % RING] = m.input;
                     have[m.frame % RING] = 1;
                     if (m.v1 != NO_FRAME) { rem_f[m.v1 % RING] = m.v1; rem_c[m.v1 % RING] = m.v2; COMPARE(m.v1); }
+                } else if (m.type == M_RESET) {
+                    rst_add(rst, m.frame);
                 } else if (m.type == M_QUIT) {
                     peer_quit = 1; peer_gone = 1;
                 }
@@ -2510,6 +2700,15 @@ static int session_loop(int role, int D, uint32_t maxframes)
                 p1 = (role == 0) ? mine : theirs;
                 p2 = (role == 0) ? theirs : mine;
             }
+        }
+
+        /* v1.9.1: reinicio sincronizado (o, en las pruebas de PC, el de la referencia) justo antes de emular este cuadro */
+        {
+            int due = rst_due(rst, frame);
+#ifdef NESNET_HOST
+            if (role == -2 && (frame == g_ref_reset[0] || frame == g_ref_reset[1])) due = 1;
+#endif
+            if (due) { retro_reset(); logf_("reinicio aplicado en el frame %u", (unsigned)frame); }
         }
 
 #ifdef NESNET_HOST
@@ -2529,6 +2728,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
             else snprintf(ov, sizeof ov, "NESNET  P%d  DELAY %d", role + 1, D);
             ui_text(2, 2, ov, 1, g_desyncs ? 0xFFFF4040 : 0xFFFFFFFF);
         }
+        if (g_toast_n > 0) { ui_text(4, 224, g_toast, 1, 0xFFFFFF40); g_toast_n--; }
         present();
         if (role >= 0 && g_netinfo == 1) netinfo_tick();
         frame++;
@@ -2572,11 +2772,13 @@ static int session_loop4(int role, int D, uint32_t maxframes)
     uint8_t  have[RING];
     uint32_t mine_f[RING], mine_c[RING], rem_f[RING], rem_c[RING];
     uint32_t frame = 0, last_rx = now_ms();
+    uint32_t rst[RST_MAX];
     int i, ended_ok = 1, peer_gone = 0, peer_quit = 0, user_exit = 0;
     char ov[64];
 
     memset(loc, 0, sizeof loc); memset(rem, 0, sizeof rem); memset(have, 0, sizeof have);
     for (i = 0; i < RING; i++) { mine_f[i] = NO_FRAME; rem_f[i] = NO_FRAME; mine_c[i] = rem_c[i] = 0; }
+    for (i = 0; i < RST_MAX; i++) rst[i] = NO_FRAME;
     if (role >= 0) for (i = 0; i < D; i++) have[i] = 1;
 
     g_run_hash = 2166136261u; g_frames_done = 0; g_desyncs = 0; g_first_desync = NO_FRAME;
@@ -2595,9 +2797,18 @@ static int session_loop4(int role, int D, uint32_t maxframes)
         uint16_t p1, p2, p3, p4;
         pump();
 
-        /* R2 del mando 1 de esta consola abre el menu de salir (igual que en el 1vs1) */
+        /* R2 del mando 1 de esta consola abre el menu (igual que en el 1vs1): continuar / reiniciar / salir */
         if (role != -2 && exit_pressed(0, frame)) {
-            if (exit_menu(role >= 0)) { user_exit = 1; logf_("salida pedida por el jugador (R2) en frame %u", (unsigned)frame); goto out; }
+            int xr = solo_menu(1);
+            if (xr == 1) { user_exit = 1; logf_("salida pedida por el jugador (R2) en frame %u", (unsigned)frame); goto out; }
+            if (xr == 2) {
+                Msg rq;
+                uint32_t F = frame + (uint32_t)D;
+                memset(&rq, 0, sizeof rq); rq.type = M_RESET; rq.frame = F;
+                if (!peer_gone && !net_send(&rq)) peer_gone = 1;
+                rst_add(rst, F);
+                logf_("reinicio pedido por el jugador (R2) en frame %u: los dos reinician en el frame %u", (unsigned)frame, (unsigned)F);
+            }
             last_rx = now_ms();
         }
 
@@ -2644,6 +2855,8 @@ static int session_loop4(int role, int D, uint32_t maxframes)
                     rem[m.frame % RING] = m.input;
                     have[m.frame % RING] = 1;
                     if (m.v1 != NO_FRAME) { rem_f[m.v1 % RING] = m.v1; rem_c[m.v1 % RING] = m.v2; COMPARE4(m.v1); }
+                } else if (m.type == M_RESET) {
+                    rst_add(rst, m.frame);
                 } else if (m.type == M_QUIT) {
                     peer_quit = 1; peer_gone = 1;
                 }
@@ -2656,6 +2869,15 @@ static int session_loop4(int role, int D, uint32_t maxframes)
                 p1 = hb & 0xFF; p2 = (uint16_t)(hb >> 8);
                 p3 = cb & 0xFF; p4 = (uint16_t)(cb >> 8);
             }
+        }
+
+        /* v1.9.1: reinicio sincronizado (igual que en el 1vs1) */
+        {
+            int due = rst_due(rst, frame);
+#ifdef NESNET_HOST
+            if (role == -2 && (frame == g_ref_reset[0] || frame == g_ref_reset[1])) due = 1;
+#endif
+            if (due) { retro_reset(); logf_("reinicio aplicado en el frame %u", (unsigned)frame); }
         }
 
 #ifdef NESNET_HOST
@@ -2707,7 +2929,7 @@ out:
 static void ui_show(const char *l1, const char *l2, const char *l3)
 {
     ui_clear();
-    ui_center(20, "NESNET V1.9", 2, 0xFFFFD040);
+    ui_center(20, "NESNET V1.9.1", 2, 0xFFFFD040);
     if (l1) ui_center(90, l1, 1, 0xFFFFFFFF);
     if (l2) ui_center(110, l2, 1, 0xFFC0C0FF);
     if (l3) ui_center(130, l3, 1, 0xFFC0C0FF);
@@ -3062,7 +3284,7 @@ static int ui_menu(void)
             else return modes[g_menu_sel];
         }
         ui_clear();
-        ui_center(20, "NESNET V1.9", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.1", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         if (g_rom) {
             fit_name(nm, sizeof nm, g_rom_name, 34);
@@ -3104,7 +3326,7 @@ static int ui_menu4(void)
         if (e & UI_CANCEL) return -1;
         if (e & (UI_OK | UI_START)) return sel == 0 ? MODE_HOST : sel == 1 ? MODE_JOIN : -1;
         ui_clear();
-        ui_center(20, "NESNET V1.9", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.1", 2, 0xFFFFD040);
         ui_center(46, "MULTIJUGADOR DE 4 (FOUR SCORE)", 1, 0xFFC0C0FF);
         ui_center(66, "HOST: MANDOS 1 Y 2", 1, 0xFF80FF80);
         ui_center(80, "EL QUE SE UNE: MANDOS 3 Y 4", 1, 0xFF80FF80);
@@ -3125,34 +3347,33 @@ static int ui_menu4(void)
 
 static int ui_enter_code(char *out)
 {
-    int d[15], pos = 0, i;
+    int d[10], pos = 0, i;
     memset(d, 0, sizeof d);
     while (g_running) {
         uint16_t e;
-        char digits[16], line[40];
+        char line[40];
         pump();
         e = ui_edges();
         if (e & UI_UP)    d[pos] = (d[pos] + 1) % 10;
         if (e & UI_DOWN)  d[pos] = (d[pos] + 9) % 10;
         if (e & UI_LEFT)  { if (pos > 0) pos--; }
-        if (e & (UI_RIGHT | UI_OK)) { if (pos < 14) pos++; }
+        if (e & (UI_RIGHT | UI_OK)) { if (pos < 9) pos++; }
         if (e & UI_CANCEL) return 0;
         if (e & UI_START) {
-            for (i = 0; i < 15; i++) out[i] = (char)('0' + d[i]);
-            out[15] = 0;
+            for (i = 0; i < 10; i++) out[i] = (char)('0' + d[i]);
+            out[10] = 0;
             return 1;
         }
-        for (i = 0; i < 15; i++) digits[i] = (char)('0' + d[i]);
-        digits[15] = 0;
         ui_clear();
-        ui_center(20, "NESNET V1.9", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.1", 2, 0xFFFFD040);
         ui_center(60, "ESCRIBE EL CODIGO DEL HOST", 1, 0xFFFFFFFF);
-        for (i = 0; i < 15; i++) {
-            char c[2] = { digits[i], 0 };
-            ui_text(28 + i * 14, 100, c, 2, i == pos ? 0xFFFFFF40 : 0xFFFFFFFF);
+        for (i = 0; i < 10; i++) {
+            char c[2] = { (char)('0' + d[i]), 0 };
+            int x = 24 + i * 20 + (i >= 3 ? 8 : 0) + (i >= 6 ? 8 : 0);     /* grupos 3-3-4 */
+            ui_text(x, 100, c, 2, i == pos ? 0xFFFFFF40 : 0xFFFFFFFF);
+            if (i == pos) ui_text(x, 118, "-", 2, 0xFFFFFF40);
         }
-        ui_text(28 + pos * 14, 118, "-", 2, 0xFFFFFF40);
-        snprintf(line, sizeof line, "DIGITO %d DE 15", pos + 1);
+        snprintf(line, sizeof line, "DIGITO %d DE 10", pos + 1);
         ui_center(140, line, 1, 0xFFC0C0FF);
         ui_center(170, "ARRIBA/ABAJO: CAMBIAR   IZQ/DER: MOVER", 1, 0xFF8080A0);
         ui_center(184, "START: CONECTAR    O: CANCELAR", 1, 0xFF8080A0);
@@ -3239,9 +3460,9 @@ static int run_host_inner(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.9", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.1", 2, 0xFFFFD040);
         ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
-        ui_center(84, code, 2, 0xFFFFFF40);
+        { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
         ui_center(136, l2, 1, 0xFFC0C0FF);
         ui_center(154, l3, 1, col3);
@@ -3380,9 +3601,9 @@ static int run_host4_inner(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.9", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.1", 2, 0xFFFFD040);
         ui_center(64, "SALA DE 4 - TU CODIGO:", 1, 0xFFFFFFFF);
-        ui_center(84, code, 2, 0xFFFFFF40);
+        { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
         ui_center(136, l2, 1, 0xFFC0C0FF);
         ui_center(154, l3, 1, col3);
@@ -3614,7 +3835,7 @@ int main(int argc, char **argv)
         static const char *items[3] = { "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS" };
         int i;
         ui_clear();
-        ui_center(20, "NESNET V1.9", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.1", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         for (i = 0; i < 3; i++) {
             char line[40];
@@ -3626,9 +3847,9 @@ int main(int argc, char **argv)
             char code[20];
             code_encode(((uint32_t)181 << 24) | (45u << 16) | (200u << 8) | 17u, 7777, code);
             ui_clear();
-            ui_center(20, "NESNET V1.9", 2, 0xFFFFD040);
+            ui_center(20, "NESNET V1.9.1", 2, 0xFFFFD040);
             ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
-            ui_center(84, code, 2, 0xFFFFFF40);
+            { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
             ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
             ui_center(136, "PUERTO 7777", 1, 0xFFC0C0FF);
             ui_center(170, "ESPERANDO AL AMIGO...", 1, 0xFFFFFFFF);
@@ -3645,7 +3866,13 @@ int main(int argc, char **argv)
     g_maxframes = frames;
     if (getenv("NESNET_UI")) { g_ui_script = getenv("NESNET_UI"); g_ui_has_script = 1; }   /* pruebas del menu de salir */
     if (getenv("NESNET_R2")) g_exit_at = (uint32_t)atoi(getenv("NESNET_R2"));
+    if (getenv("NESNET_R2B")) g_exit_at2 = (uint32_t)atoi(getenv("NESNET_R2B"));
     if (getenv("NESNET_NETINFO")) g_netinfo = atoi(getenv("NESNET_NETINFO"));   /* prueba: modo de info de red */
+    if (getenv("NESNET_RESET_REF")) {                                            /* prueba v1.9.1: reinicios de la referencia "a" o "a,b" */
+        const char *rr = getenv("NESNET_RESET_REF");
+        g_ref_reset[0] = (uint32_t)atoi(rr);
+        if (strchr(rr, ',')) g_ref_reset[1] = (uint32_t)atoi(strchr(rr, ',') + 1);
+    }
     signal(SIGPIPE, SIG_IGN);
     if (!strcmp(mode, "app")) {
         /* flujo real: lee DIR/config.txt y ejecuta app_main (argv[4] = carpeta) */
@@ -3949,15 +4176,61 @@ int main(int argc, char **argv)
         D = 6;
         core_load(); session_loop(-2, D, frames); core_unload();
     } else if (!strcmp(mode, "codetest")) {
-        char c[20]; uint32_t ip; int p, n = 0, bad = 0;
+        /* v1.9.1: codigo de 10 digitos (solo la IP); el puerto sale de config.txt */
+        char c[20], pc[24]; uint32_t ip; int p, n = 0, bad = 0;
         uint32_t t;
+        g_cfg.port = 7777;
         for (t = 0; t < 200000; t++) {
-            uint32_t a = t * 2654435761u; int pt = 1 + (int)(t * 40503u % 65535);
-            code_encode(a ? a : 1, pt, c);
-            if (!code_decode(c, &ip, &p) || ip != (a ? a : 1) || p != pt) bad++;
+            uint32_t a = t * 2654435761u;
+            code_encode(a ? a : 1, 7777, c);
+            if (strlen(c) != 10 || !code_decode(c, &ip, &p) || ip != (a ? a : 1) || p != 7777) bad++;
+            code_pretty(c, pc);
+            if (strlen(pc) != 12 || !code_decode(pc, &ip, &p) || ip != (a ? a : 1)) bad++;      /* con espacios tambien */
             n++;
         }
+        code_encode(0xB92DC811u, 7777, c);                                  /* 185.45.200.17 */
+        if (strcmp(c, "3106785297")) { bad++; printf("codetest muestra: %s\n", c); }
+        code_encode(0x01020304u, 7777, c);
+        if (strcmp(c, "0016909060")) { bad++; printf("codetest muestra2: %s\n", c); }
+        if (code_decode("12345", &ip, &p) || code_decode("12345678901", &ip, &p) || code_decode("4294967296", &ip, &p) ||
+            code_decode("0000000000", &ip, &p) || code_decode("123456789012345", &ip, &p)) { bad++; printf("codetest: acepto un codigo malo\n"); }
         printf("codetest n=%d bad=%d\n", n, bad);
+        return bad != 0;
+    } else if (!strcmp(mode, "statetest")) {
+        /* v1.9.1: guardar y cargar estado. Tras cargar, los siguientes cuadros deben dar exactamente los mismos CRC de video. */
+        static uint32_t ca[300], cb[300], cc[300];
+        uint32_t f;
+        size_t n;
+        uint8_t *buf;
+        unsigned bad = 0;
+        core_load();
+        n = retro_serialize_size();
+        printf("statetest: el nucleo pide %u bytes de estado\n", (unsigned)n);
+        for (f = 0; f < 300; f++) step_frame(script_input(0, f), script_input(1, f));
+        buf = (uint8_t *)malloc(n);
+        if (!buf || !retro_serialize(buf, n)) { printf("statetest: no pude serializar\n"); return 1; }
+        for (f = 300; f < 600; f++) { step_frame(script_input(0, f), script_input(1, f)); ca[f - 300] = g_frame_crc; }
+        if (!retro_unserialize(buf, n)) { printf("statetest: no pude cargar\n"); return 1; }
+        for (f = 300; f < 600; f++) { step_frame(script_input(0, f), script_input(1, f)); cb[f - 300] = g_frame_crc; }
+        for (f = 0; f < 300; f++) if (ca[f] != cb[f]) bad++;
+        printf("statetest memoria: cuadros distintos tras cargar = %u\n", bad);
+        /* por archivo: guardar en la ranura 2, seguir, cargar, repetir */
+        retro_unserialize(buf, n);
+        free(buf);
+        mkdir("/tmp/nn_state_test", 0777);
+        snprintf(g_dir, sizeof g_dir, "/tmp/nn_state_test");
+        if (!state_save(1)) { printf("statetest: no pude guardar archivo\n"); return 1; }
+        for (f = 300; f < 600; f++) { step_frame(script_input(0, f), script_input(1, f)); ca[f - 300] = g_frame_crc; }
+        if (state_load(1) != 1) { printf("statetest: no pude cargar archivo\n"); return 1; }
+        for (f = 300; f < 600; f++) { step_frame(script_input(0, f), script_input(1, f)); cc[f - 300] = g_frame_crc; }
+        {
+            unsigned bad2 = 0;
+            for (f = 0; f < 300; f++) if (ca[f] != cc[f]) bad2++;
+            printf("statetest archivo: cuadros distintos tras cargar = %u\n", bad2);
+            bad += bad2;
+        }
+        printf("statetest existe(ranura 2)=%d existe(ranura 1)=%d\n", state_exists(1), state_exists(0));
+        core_unload();
         return bad != 0;
     }
     printf("RESULT mode=%s frames=%u hash=%08X desyncs=%d D=%d first_desync=%d\n", mode,
