@@ -688,8 +688,17 @@ static int g_map[2][MA_COUNT] = {
 };
 static unsigned g_turbo_cnt[2][2];     /* cuadros seguidos que lleva apretado cada turbo (A, B) de cada mando */
 static int      g_screen;              /* 0 = original (pixeles cuadrados, como hasta ahora), 1 = 4:3 real, 2 = 16:9 estirada */
+/* v1.9.3: la opcion de pantalla (g_screen) es solo para la imagen del JUEGO. Los menus y avisos (todo lo que se dibuja fuera de una
+ * partida) usan siempre MENU_SCREEN, asi no cambian de tamano al mover ORIGINAL / 4:3 / 16:9. El ajuste de imagen (tamano y
+ * desplazamiento, para el overscan de la TV) sigue valiendo para todo. Usan la pantalla elegida: session_loop / session_loop4
+ * (g_ingame = 1 mientras corren; el menu de R2 sobre el juego cuenta como juego) y la pantalla AJUSTE DE IMAGEN (g_adjusting = 1),
+ * que tiene que mostrar el marco con la geometria real del juego. */
+#define MENU_SCREEN 2                  /* 2 = 16:9 a pantalla completa (1 = 4:3 centrado, 0 = original) */
+static int      g_ingame;
+static int      g_adjusting;
 static int      g_netinfo;             /* v1.9: info de red en partida: 0 = solo al inicio (como siempre), 1 = siempre, 2 = no */
 static char     g_last_rom[ROM_NAMELEN];   /* v1.9: nombre del archivo de la ultima ROM elegida */
+static char     g_last_code[16];           /* v1.9.3: ultimo codigo de sala escrito al UNIRSE (10 digitos, o vacio) */
 static int      g_showfps;             /* v1.9.2: 1 = FPS abajo a la derecha (en SOLO y online), 0 = no */
 /* v1.9.2: ajuste de imagen (OPCIONES > AJUSTE DE IMAGEN): tamano en % de la imagen de la pantalla elegida y
  * desplazamiento en pixeles de la TV. Con los valores de siempre (100, 0, 0) se usa el dibujo de antes, sin cambios. */
@@ -872,6 +881,7 @@ static void opts_defaults(void)
     g_showfps = 0;
     g_img_size = 100; g_img_dx = 0; g_img_dy = 0;
     g_last_rom[0] = 0;
+    g_last_code[0] = 0;
 }
 
 static void opts_save(void)
@@ -892,6 +902,7 @@ static void opts_save(void)
     fprintf(f, "imgx=%d\n", g_img_dx);
     fprintf(f, "imgy=%d\n", g_img_dy);
     if (g_last_rom[0]) fprintf(f, "rom=%s\n", g_last_rom);
+    if (g_last_code[0]) fprintf(f, "code=%s\n", g_last_code);
     for (p = 0; p < 2; p++)
         fprintf(f, "pad%d=%d,%d,%d,%d,%d,%d\n", p + 1, g_map[p][0], g_map[p][1], g_map[p][2], g_map[p][3], g_map[p][4], g_map[p][5]);
     fclose(f);
@@ -928,6 +939,14 @@ static void opts_load(void)
             size_t n = strlen(line + 4);
             while (n > 0 && (line[4 + n - 1] == '\n' || line[4 + n - 1] == '\r')) n--;
             if (n > 0 && n < ROM_NAMELEN && !memchr(line + 4, '/', n) && line[4] != '.') { memcpy(g_last_rom, line + 4, n); g_last_rom[n] = 0; }
+        } else if (!strncmp(line, "code=", 5)) {
+            /* v1.9.3: solo se acepta si son exactamente 10 digitos */
+            size_t n = strlen(line + 5), k;
+            int okc;
+            while (n > 0 && (line[5 + n - 1] == '\n' || line[5 + n - 1] == '\r')) n--;
+            okc = (n == 10);
+            for (k = 0; okc && k < n; k++) if (line[5 + k] < '0' || line[5 + k] > '9') okc = 0;
+            if (okc) { memcpy(g_last_code, line + 5, 10); g_last_code[10] = 0; }
         } else if ((line[0] == 'p' && line[1] == 'a' && line[2] == 'd' && (line[3] == '1' || line[3] == '2') && line[4] == '=') &&
                    sscanf(line + 5, "%d,%d,%d,%d,%d,%d", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) == 6) {
             p = line[3] - '1';
@@ -1117,6 +1136,7 @@ static void gpu_blit_canvas(void)
     if (g_cfg.render) {
         /* Modo CPU: sin transferencia ni clear ni blend de la GPU; escribo directo en el buffer de pantalla */
         static unsigned cpu_frame[2];     /* un contador por buffer de pantalla (v1.4) */
+        int smode = (g_ingame || g_adjusting) ? g_screen : MENU_SCREEN;   /* v1.9.3 */
         if (!g_first) {
             int guard = 0;
             while (gcmGetFlipStatus() != 0 && guard++ < 15000) usleep(200);
@@ -1126,9 +1146,9 @@ static void gpu_blit_canvas(void)
          * residuo del XMB (reloj / bateria del mando); el juego mismo se repinta siempre.
          * v1.8.2: el escalado (modo de pantalla elegido en OPCIONES) y esa limpieza viven en canvas_blit_cpu. */
         if (g_img_size == 100 && g_img_dx == 0 && g_img_dy == 0)
-            canvas_blit_cpu((uint32_t *)g_cbuf[g_cur], (int)g_dw, (int)g_dh, g_screen, g_zoom, (const uint32_t *)g_fb, &cpu_frame[g_cur & 1]);
+            canvas_blit_cpu((uint32_t *)g_cbuf[g_cur], (int)g_dw, (int)g_dh, smode, g_zoom, (const uint32_t *)g_fb, &cpu_frame[g_cur & 1]);
         else   /* v1.9.2: con el ajuste de imagen tocado */
-            canvas_blit_adj((uint32_t *)g_cbuf[g_cur], (int)g_dw, (int)g_dh, g_screen, g_zoom, (const uint32_t *)g_fb, &cpu_frame[g_cur & 1],
+            canvas_blit_adj((uint32_t *)g_cbuf[g_cur], (int)g_dw, (int)g_dh, smode, g_zoom, (const uint32_t *)g_fb, &cpu_frame[g_cur & 1],
                             g_img_size, g_img_dx, g_img_dy);
         return;
     }
@@ -2857,6 +2877,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
 
     g_run_hash = 2166136261u; g_frames_done = 0; g_desyncs = 0; g_first_desync = NO_FRAME;
     g_stage = role == 0 ? "juego-host" : role == 1 ? "juego-cliente" : "juego-local";
+    g_ingame = 1;                           /* v1.9.3: desde aqui la imagen usa la pantalla elegida en OPCIONES */
     memset(&g_gsw, 0, sizeof g_gsw); g_gsw.go = NO_FRAME; g_sw_pending = 0;      /* v1.9.2: cambio de juego */
     g_ka_on = role >= 0; g_ka_last = now_ms();
     g_ni_t0 = 0; g_ni_last = 0; g_ni_fps = 0;
@@ -3000,6 +3021,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
         if (role == -1 && (frame % 300) == 0) sram_save(0);      /* v1.9: guardado de bateria cada ~5 s si cambio (solo SOLO) */
     }
 out:
+    g_ingame = 0;                           /* v1.9.3: al salir de la partida, los menus vuelven a MENU_SCREEN */
     g_ka_on = 0;
     if (role >= 0 && g_net >= 0 && !g_sw_pending) {       /* v1.9.2: en un cambio de juego no se avisa de salida */
         Msg q; memset(&q, 0, sizeof q); q.type = M_QUIT; net_send(&q);
@@ -3048,6 +3070,7 @@ static int session_loop4(int role, int D, uint32_t maxframes)
 
     g_run_hash = 2166136261u; g_frames_done = 0; g_desyncs = 0; g_first_desync = NO_FRAME;
     g_stage = role == 0 ? "juego4-host" : role == 1 ? "juego4-cliente" : "juego4-ref";
+    g_ingame = 1;                           /* v1.9.3: desde aqui la imagen usa la pantalla elegida en OPCIONES */
     memset(&g_gsw, 0, sizeof g_gsw); g_gsw.go = NO_FRAME; g_sw_pending = 0;      /* v1.9.2: cambio de juego */
     g_ka_on = role >= 0; g_ka_last = now_ms();
     g_ni_t0 = 0; g_ni_last = 0; g_ni_fps = 0;
@@ -3181,6 +3204,7 @@ static int session_loop4(int role, int D, uint32_t maxframes)
         g_frames_done = frame;
     }
 out:
+    g_ingame = 0;                           /* v1.9.3: al salir de la partida, los menus vuelven a MENU_SCREEN */
     g_ka_on = 0;
     if (role >= 0 && g_net >= 0 && !g_sw_pending) {       /* v1.9.2: en un cambio de juego no se avisa de salida */
         Msg q; memset(&q, 0, sizeof q); q.type = M_QUIT; net_send(&q);
@@ -3208,7 +3232,7 @@ out:
 static void ui_show(const char *l1, const char *l2, const char *l3)
 {
     ui_clear();
-    ui_center(20, "NESNET V1.9.2", 2, 0xFFFFD040);
+    ui_center(20, "NESNET V1.9.3", 2, 0xFFFFD040);
     if (l1) ui_center(90, l1, 1, 0xFFFFFFFF);
     if (l2) ui_center(110, l2, 1, 0xFFC0C0FF);
     if (l3) ui_center(130, l3, 1, 0xFFC0C0FF);
@@ -3355,7 +3379,7 @@ static void ui_opt_screen(void)
         if (e & (UI_OK | UI_CANCEL | UI_START)) break;
         ui_clear();
         ui_center(20, "PANTALLA", 2, 0xFFFFD040);
-        ui_center(46, "LA IMAGEN CAMBIA AL MOVER EL CURSOR", 1, 0xFFC0C0FF);
+        ui_center(46, "SOLO CAMBIA LA IMAGEN DEL JUEGO", 1, 0xFFC0C0FF);
         for (i = 0; i < 3; i++) {
             char line[48];
             snprintf(line, sizeof line, "%s %s", i == g_screen ? ">" : " ", screen_names[i]);
@@ -3537,6 +3561,7 @@ static void ui_opt_image(void)
 {
     int sel = 0, i, x, y;
     g_stage = "opciones-imagen";
+    g_adjusting = 1;                        /* v1.9.3: esta pantalla muestra el marco con la geometria real del juego */
     ui_prime();
     while (g_running) {
         uint16_t e;
@@ -3587,6 +3612,7 @@ static void ui_opt_image(void)
         sleep_ms(16);
 #endif
     }
+    g_adjusting = 0;
     logf_("opciones: imagen = %d%% %+d %+d", g_img_size, g_img_dx, g_img_dy);
 }
 
@@ -3651,7 +3677,7 @@ static int ui_menu(void)
             else return modes[g_menu_sel];
         }
         ui_clear();
-        ui_center(20, "NESNET V1.9.2", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.3", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         if (g_rom) {
             fit_name(nm, sizeof nm, g_rom_name, 34);
@@ -3693,7 +3719,7 @@ static int ui_menu4(void)
         if (e & UI_CANCEL) return -1;
         if (e & (UI_OK | UI_START)) return sel == 0 ? MODE_HOST : sel == 1 ? MODE_JOIN : -1;
         ui_clear();
-        ui_center(20, "NESNET V1.9.2", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.3", 2, 0xFFFFD040);
         ui_center(46, "MULTIJUGADOR DE 4 (FOUR SCORE)", 1, 0xFFC0C0FF);
         ui_center(66, "HOST: MANDOS 1 Y 2", 1, 0xFF80FF80);
         ui_center(80, "EL QUE SE UNE: MANDOS 3 Y 4", 1, 0xFF80FF80);
@@ -3714,25 +3740,38 @@ static int ui_menu4(void)
 
 static int ui_enter_code(char *out)
 {
-    int d[10], pos = 0, i;
+    int d[10], pos = 0, i, saved = 0;
     memset(d, 0, sizeof d);
+    /* v1.9.3: si hay un codigo guardado de la vez anterior, aparece ya escrito; se confirma con START (no se conecta solo) */
+    if (strlen(g_last_code) == 10) {
+        for (i = 0; i < 10; i++) d[i] = g_last_code[i] - '0';
+        saved = 1;
+    }
     while (g_running) {
         uint16_t e;
         char line[40];
         pump();
         e = ui_edges();
-        if (e & UI_UP)    d[pos] = (d[pos] + 1) % 10;
-        if (e & UI_DOWN)  d[pos] = (d[pos] + 9) % 10;
+        if (e & UI_UP)    { d[pos] = (d[pos] + 1) % 10; saved = 0; }
+        if (e & UI_DOWN)  { d[pos] = (d[pos] + 9) % 10; saved = 0; }
         if (e & UI_LEFT)  { if (pos > 0) pos--; }
         if (e & (UI_RIGHT | UI_OK)) { if (pos < 9) pos++; }
         if (e & UI_CANCEL) return 0;
         if (e & UI_START) {
             for (i = 0; i < 10; i++) out[i] = (char)('0' + d[i]);
             out[10] = 0;
+            {
+                uint32_t vip; int vport;
+                if (strcmp(g_last_code, out) != 0 && code_decode(out, &vip, &vport)) {   /* lo recuerda para la proxima vez (aunque se apague la PS3); un codigo invalido no se guarda */
+                    snprintf(g_last_code, sizeof g_last_code, "%.10s", out);
+                    opts_save();
+                    logf_("codigo de sala guardado en opciones.txt");
+                }
+            }
             return 1;
         }
         ui_clear();
-        ui_center(20, "NESNET V1.9.2", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.3", 2, 0xFFFFD040);
         ui_center(60, "ESCRIBE EL CODIGO DEL HOST", 1, 0xFFFFFFFF);
         for (i = 0; i < 10; i++) {
             char c[2] = { (char)('0' + d[i]), 0 };
@@ -3742,6 +3781,7 @@ static int ui_enter_code(char *out)
         }
         snprintf(line, sizeof line, "DIGITO %d DE 10", pos + 1);
         ui_center(140, line, 1, 0xFFC0C0FF);
+        if (saved) ui_center(154, "ULTIMO CODIGO USADO (START: CONECTAR)", 1, 0xFF80FF80);
         ui_center(170, "ARRIBA/ABAJO: CAMBIAR   IZQ/DER: MOVER", 1, 0xFF8080A0);
         ui_center(184, "START: CONECTAR    O: CANCELAR", 1, 0xFF8080A0);
         present();
@@ -3833,7 +3873,7 @@ static int run_host_inner(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.9.2", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.3", 2, 0xFFFFD040);
         ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
         { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -3979,7 +4019,7 @@ static int run_host4_inner(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.9.2", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.3", 2, 0xFFFFD040);
         ui_center(64, "SALA DE 4 - TU CODIGO:", 1, 0xFFFFFFFF);
         { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -4084,7 +4124,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("NesNet v1.9 - dir=%s", g_dir);
+    logf_("NesNet v1.9.3 (menus siempre a pantalla completa; codigo de sala guardado al unirse) - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
@@ -4213,7 +4253,7 @@ int main(int argc, char **argv)
         static const char *items[3] = { "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS" };
         int i;
         ui_clear();
-        ui_center(20, "NESNET V1.9.2", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.3", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         for (i = 0; i < 3; i++) {
             char line[40];
@@ -4225,7 +4265,7 @@ int main(int argc, char **argv)
             char code[20];
             code_encode(((uint32_t)181 << 24) | (45u << 16) | (200u << 8) | 17u, 7777, code);
             ui_clear();
-            ui_center(20, "NESNET V1.9.2", 2, 0xFFFFD040);
+            ui_center(20, "NESNET V1.9.3", 2, 0xFFFFD040);
             ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
             { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
             ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
