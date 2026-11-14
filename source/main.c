@@ -744,14 +744,14 @@ static uint16_t map_nes_bits(int port, uint32_t btns, uint16_t dirs)
 }
 
 /* ¿Puede la accion 'act' del mando 'port' tomar el boton 'btn'? Reglas: solo los turbo pueden quedar sin boton;
- * R2 del mando 1 esta reservado (abre el menu de salir); un boton que ya usa OTRA fila del mismo mando no se puede tomar
+ * R3 del mando 1 esta reservado (abre el menu de salir); un boton que ya usa OTRA fila del mismo mando no se puede tomar
  * (nunca se mueve un boton ajeno: para cambiarlo, primero se libera en su fila). */
 static int map_allowed(int port, int act, int btn)
 {
     int a;
     if (btn == PB_NONE) return act >= MA_TA;
     if (btn < 0 || btn >= PB_COUNT) return 0;
-    if (port == 0 && btn == PB_R2) return 0;
+    if (port == 0 && btn == PB_R3) return 0;
     for (a = 0; a < MA_COUNT; a++)
         if (a != act && g_map[port][a] == btn) return 0;
     return 1;
@@ -771,14 +771,14 @@ static void map_cycle(int port, int act, int dir)
     }
 }
 
-/* Comprueba un mapeo leido de archivo: botones normales siempre asignados, sin repetidos, sin R2 en el mando 1 */
+/* Comprueba un mapeo leido de archivo: botones normales siempre asignados, sin repetidos, sin R3 en el mando 1 */
 static int map_valid(const int *m, int port)
 {
     int a, c;
     for (a = 0; a < MA_COUNT; a++) {
         if (m[a] == PB_NONE) { if (a < MA_TA) return 0; continue; }
         if (m[a] < 0 || m[a] >= PB_COUNT) return 0;
-        if (port == 0 && m[a] == PB_R2) return 0;
+        if (port == 0 && m[a] == PB_R3) return 0;
         for (c = a + 1; c < MA_COUNT; c++) if (m[c] == m[a]) return 0;
     }
     return 1;
@@ -1322,13 +1322,13 @@ static uint16_t ui_edges(void)
     return e;
 }
 
-/* v1.7: R2 abre el menu de salir (en NES R2 no se usa). prime=1 solo memoriza el estado actual,
- * para ignorar un R2 que siga apretado al empezar la partida (se aprieta R2 al abrir para quitar el audio). */
+/* v1.9.5: R3 (clic de la palanca izquierda) abre el menu en partida (antes R2: a un amigo se le escapaba el dedo y el menu abierto
+ * frena la partida online). prime=1 solo memoriza el estado actual, para ignorar un R3 que siga apretado al empezar la partida. */
 static int exit_pressed(int prime, uint32_t frame)
 {
     static int prev;
     padData *d = pad_read(0);
-    int now = d->BTN_R2 ? 1 : 0;
+    int now = d->BTN_R3 ? 1 : 0;
     int e = now && !prev;
     (void)frame;
     prev = now;
@@ -3405,7 +3405,7 @@ out:
 static void ui_show(const char *l1, const char *l2, const char *l3)
 {
     ui_clear();
-    ui_center(20, "NESNET V1.9.4", 2, 0xFFFFD040);
+    ui_center(20, "NESNET V1.9.5", 2, 0xFFFFD040);
     if (l1) ui_center(90, l1, 1, 0xFFFFFFFF);
     if (l2) ui_center(110, l2, 1, 0xFFC0C0FF);
     if (l3) ui_center(130, l3, 1, 0xFFC0C0FF);
@@ -3606,7 +3606,7 @@ static void ui_opt_pad(int port)
         }
         ui_center(176, "IZQ/DER: CAMBIAR (SALTA LOS USADOS)", 1, 0xFFC0C0FF);
         ui_center(190, "TURBO: 15 PULSOS POR SEGUNDO", 1, 0xFFC0C0FF);
-        if (port == 0) ui_center(204, "R2 DEL MANDO 1 ES PARA SALIR", 1, 0xFFFFC040);
+        if (port == 0) ui_center(204, "R3 DEL MANDO 1 ABRE EL MENU", 1, 0xFFFFC040);
         ui_center(218, "O: VOLVER", 1, 0xFF8080A0);
         present();
 #ifdef NESNET_HOST
@@ -3856,7 +3856,7 @@ static int ui_menu(void)
             else return modes[g_menu_sel];
         }
         ui_clear();
-        ui_center(20, "NESNET V1.9.4", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.5", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         if (g_rom) {
             fit_name(nm, sizeof nm, g_rom_name, 34);
@@ -3873,7 +3873,7 @@ static int ui_menu(void)
             ui_center(90 + i * 17, line, 1, col);
         }
         ui_center(196, "ARRIBA/ABAJO + X", 1, 0xFF8080A0);
-        ui_center(209, "EN PARTIDA: R2 = MENU", 1, 0xFF8080A0);
+        ui_center(209, "EN PARTIDA: R3 = MENU", 1, 0xFF8080A0);
         ui_center(222, "O: SALIR AL XMB", 1, 0xFF8080A0);
         present();
 #ifdef NESNET_HOST
@@ -3899,7 +3899,7 @@ static int ui_menu4(void)
         if (e & UI_CANCEL) return -1;
         if (e & (UI_OK | UI_START)) return sel == 0 ? MODE_HOST : sel == 1 ? MODE_JOIN : -1;
         ui_clear();
-        ui_center(20, "NESNET V1.9.4", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.5", 2, 0xFFFFD040);
         ui_center(46, "MULTIJUGADOR DE 4 (FOUR SCORE)", 1, 0xFFC0C0FF);
         ui_center(66, "HOST: MANDOS 1 Y 2", 1, 0xFF80FF80);
         ui_center(80, "EL QUE SE UNE: MANDOS 3 Y 4", 1, 0xFF80FF80);
@@ -3909,7 +3909,7 @@ static int ui_menu4(void)
             ui_center(110 + i * 22, line, 1, i == sel ? 0xFFFFFFFF : 0xFF8080A0);
         }
         ui_center(190, "SOLO JUEGOS CON FOUR SCORE", 1, 0xFF8080A0);
-        ui_center(204, "EN PARTIDA: R2 = MENU", 1, 0xFF8080A0);
+        ui_center(204, "EN PARTIDA: R3 = MENU", 1, 0xFF8080A0);
         present();
 #ifdef NESNET_HOST
         sleep_ms(16);
@@ -3951,7 +3951,7 @@ static int ui_enter_code(char *out)
             return 1;
         }
         ui_clear();
-        ui_center(20, "NESNET V1.9.4", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.5", 2, 0xFFFFD040);
         ui_center(60, "ESCRIBE EL CODIGO DEL HOST", 1, 0xFFFFFFFF);
         for (i = 0; i < 10; i++) {
             char c[2] = { (char)('0' + d[i]), 0 };
@@ -4053,7 +4053,7 @@ static int run_host_inner(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.9.4", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.5", 2, 0xFFFFD040);
         ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
         { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -4199,7 +4199,7 @@ static int run_host4_inner(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.9.4", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.5", 2, 0xFFFFD040);
         ui_center(64, "SALA DE 4 - TU CODIGO:", 1, 0xFFFFFFFF);
         { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -4304,7 +4304,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("NesNet v1.9.4 (6 ranuras de estado; guardar/cargar estado online (host); O sale al XMB; menus siempre a pantalla completa; codigo de sala guardado al unirse) - dir=%s", g_dir);
+    logf_("NesNet v1.9.5 (menu en partida con R3; 6 ranuras de estado; guardar/cargar estado online (host); O sale al XMB; menus siempre a pantalla completa; codigo de sala guardado al unirse) - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
@@ -4433,7 +4433,7 @@ int main(int argc, char **argv)
         static const char *items[3] = { "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS" };
         int i;
         ui_clear();
-        ui_center(20, "NESNET V1.9.4", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.5", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         for (i = 0; i < 3; i++) {
             char line[40];
@@ -4445,7 +4445,7 @@ int main(int argc, char **argv)
             char code[20];
             code_encode(((uint32_t)181 << 24) | (45u << 16) | (200u << 8) | 17u, 7777, code);
             ui_clear();
-            ui_center(20, "NESNET V1.9.4", 2, 0xFFFFD040);
+            ui_center(20, "NESNET V1.9.5", 2, 0xFFFFD040);
             ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
             { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
             ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -4591,8 +4591,8 @@ int main(int argc, char **argv)
             map_cycle(0, MA_A, +1);                                           /* A: O -> CUADRADO (libre) */
             if (g_map[0][MA_A] != PB_SQUARE) rb++;
             opts_defaults();
-            map_cycle(0, MA_A, -1);                                           /* A hacia atras: salta X (B), "sin asignar" (no vale), SELECT y START (usados) -> R3 */
-            if (g_map[0][MA_A] != PB_R3 || g_map[0][MA_B] != PB_CROSS) rb++;
+            map_cycle(0, MA_A, -1);                                           /* A hacia atras: salta X (B), "sin asignar" (no vale), SELECT y START (usados) -> L3 (R3 esta reservado) */
+            if (g_map[0][MA_A] != PB_L3 || g_map[0][MA_B] != PB_CROSS) rb++;
             opts_defaults();
             map_cycle(0, MA_TA, +1);                                          /* turbo A: sin asignar -> salta X y O (usados) -> CUADRADO */
             if (g_map[0][MA_TA] != PB_SQUARE) rb++;
@@ -4600,13 +4600,13 @@ int main(int argc, char **argv)
             if (g_map[0][MA_TA] != PB_NONE) rb++;
             map_assign(0, MA_TA, PB_NONE); map_assign(0, MA_TB, PB_NONE);     /* quitar un turbo ya quitado no toca nada mas */
             if (g_map[0][MA_TA] != PB_NONE || g_map[0][MA_TB] != PB_NONE || g_map[0][MA_A] != PB_CIRCLE) rb++;
-            /* R2: el mando 1 nunca puede tenerlo; el mando 2 si. Se recorre todo el ciclo de un turbo */
+            /* R3: el mando 1 nunca puede tenerlo; el mando 2 si. Se recorre todo el ciclo de un turbo */
             for (p = 0; p < 2; p++) {
                 opts_defaults();
                 memset(seen, 0, sizeof seen);
                 for (k = 0; k < 40; k++) { map_cycle((int)p, MA_TA, +1); seen[g_map[p][MA_TA] + 1]++; }
-                if (p == 0 && seen[PB_R2 + 1] != 0) rb++;
-                if (p == 1 && seen[PB_R2 + 1] == 0) rb++;
+                if (p == 0 && seen[PB_R3 + 1] != 0) rb++;
+                if (p == 1 && seen[PB_R3 + 1] == 0) rb++;
                 if (seen[0] == 0) rb++;                                       /* "sin asignar" tambien se alcanza */
                 if (seen[PB_CROSS + 1] != 0 || seen[PB_CIRCLE + 1] != 0 || seen[PB_START + 1] != 0 || seen[PB_SELECT + 1] != 0) rb++;   /* nunca pisa botones usados */
             }
@@ -4615,11 +4615,11 @@ int main(int argc, char **argv)
                 int ok[MA_COUNT]  = { PB_CIRCLE, PB_CROSS, PB_SELECT, PB_START, PB_NONE, PB_NONE };
                 int dup[MA_COUNT] = { PB_CIRCLE, PB_CIRCLE, PB_SELECT, PB_START, PB_NONE, PB_NONE };
                 int non[MA_COUNT] = { PB_NONE, PB_CROSS, PB_SELECT, PB_START, PB_NONE, PB_NONE };
-                int r2[MA_COUNT]  = { PB_R2, PB_CROSS, PB_SELECT, PB_START, PB_NONE, PB_NONE };
+                int r2[MA_COUNT]  = { PB_R3, PB_CROSS, PB_SELECT, PB_START, PB_NONE, PB_NONE };
                 int big[MA_COUNT] = { PB_CIRCLE, PB_CROSS, PB_SELECT, PB_START, 99, PB_NONE };
                 if (!map_valid(ok, 0) || !map_valid(ok, 1)) rb++;
                 if (map_valid(dup, 0) || map_valid(non, 0) || map_valid(r2, 0) || map_valid(big, 1)) rb++;
-                if (!map_valid(r2, 1)) rb++;                                  /* R2 vale en el mando 2 */
+                if (!map_valid(r2, 1)) rb++;                                  /* R3 vale en el mando 2 */
             }
             printf("maptest reglas: bad=%u\n", rb);
             bad += rb;
