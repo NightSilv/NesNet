@@ -68,6 +68,7 @@ int closesocket(int s);      /* definida en libnet, pero sin prototipo en las ca
 /* v1.9.2: el mensaje M_GAME (el host cambia de juego desde R2) vuelve a cambiar el protocolo: 1vs1 = 5, modo de 4 = 6. */
 /* v1.9.4: el mensaje M_STATE (el host carga un estado guardado y se lo manda al amigo) cambia el protocolo otra vez: 1vs1 = 7, modo de 4 = 8.
  * Una v1.9.3 y una v1.9.4 se rechazan en el saludo en vez de desincronizarse. */
+/* v1.9.6: captura de pantalla con L2 (local, no toca la red): el protocolo NO cambia, 1vs1 = 7 y modo de 4 = 8 como en la v1.9.5. */
 #define PROTO_VER      7
 #define DEFAULT_PORT   7777
 #define SCR_W          256
@@ -148,6 +149,8 @@ static uint16_t g_pad[4];                 /* entrada NES que ve el nucleo (v1.8:
 static int      g_four;                   /* v1.8: 1 = partida de 4 jugadores (Four Score), 0 = 1vs1 como siempre */
 static unsigned g_pixfmt = RETRO_PIXEL_FORMAT_RGB565;
 static uint32_t g_frame_crc;
+static int      g_vid_fresh;              /* v1.9.6: 1 = el nucleo entrego imagen nueva en este cuadro (g_fb esta limpia, sin textos encima) */
+static int      g_shot_req;               /* v1.9.6: 1 = hay una captura pedida (L2); se toma justo despues de emular el cuadro */
 static int      g_core_loaded;
 
 static int      g_net = -1;               /* socket de la partida */
@@ -744,14 +747,14 @@ static uint16_t map_nes_bits(int port, uint32_t btns, uint16_t dirs)
 }
 
 /* ¿Puede la accion 'act' del mando 'port' tomar el boton 'btn'? Reglas: solo los turbo pueden quedar sin boton;
- * R3 del mando 1 esta reservado (abre el menu de salir); un boton que ya usa OTRA fila del mismo mando no se puede tomar
+ * R3 y L2 del mando 1 estan reservados (R3 abre el menu, L2 hace la captura); un boton que ya usa OTRA fila del mismo mando no se puede tomar
  * (nunca se mueve un boton ajeno: para cambiarlo, primero se libera en su fila). */
 static int map_allowed(int port, int act, int btn)
 {
     int a;
     if (btn == PB_NONE) return act >= MA_TA;
     if (btn < 0 || btn >= PB_COUNT) return 0;
-    if (port == 0 && btn == PB_R3) return 0;
+    if (port == 0 && (btn == PB_R3 || btn == PB_L2)) return 0;
     for (a = 0; a < MA_COUNT; a++)
         if (a != act && g_map[port][a] == btn) return 0;
     return 1;
@@ -778,7 +781,7 @@ static int map_valid(const int *m, int port)
     for (a = 0; a < MA_COUNT; a++) {
         if (m[a] == PB_NONE) { if (a < MA_TA) return 0; continue; }
         if (m[a] < 0 || m[a] >= PB_COUNT) return 0;
-        if (port == 0 && m[a] == PB_R3) return 0;
+        if (port == 0 && (m[a] == PB_R3 || m[a] == PB_L2)) return 0;
         for (c = a + 1; c < MA_COUNT; c++) if (m[c] == m[a]) return 0;
     }
     return 1;
@@ -1335,6 +1338,22 @@ static int exit_pressed(int prime, uint32_t frame)
     return prime ? 0 : e;
 }
 
+/* v1.9.6: L2 del mando 1 = captura de pantalla (solo en partida; en OPCIONES > MANDOS el mando 1 no puede asignarse L2).
+ * prime=1 solo memoriza el estado actual, para ignorar un L2 que siga apretado al empezar la partida. */
+static int shot_pressed(int prime, uint32_t frame)
+{
+    static int prev;
+    padData *d = pad_read(0);
+    int now = d->BTN_L2 ? 1 : 0;
+    int e = now && !prev;
+    (void)frame;
+    prev = now;
+    return prime ? 0 : e;
+}
+
+/* medidas reales de la pantalla de la consola (para que la captura salga del mismo tamano que la imagen del juego) */
+static void shot_geometry(int *dw, int *dh, int *z) { *dw = (int)g_dw; *dh = (int)g_dh; *z = g_zoom; }
+
 /* descarta pulsaciones viejas del menu (memoriza lo que esta apretado ahora) */
 static void ui_prime(void) { (void)ui_edges(); }
 
@@ -1369,6 +1388,16 @@ static uint16_t ui_edges(void)
 static uint16_t pad_nes_bits(int port) { (void)port; return 0; }
 static void ui_prime(void) {}
 static int exit_pressed(int prime, uint32_t frame) { return !prime && (frame == g_exit_at || frame == g_exit_at2); }
+/* prueba v1.9.6: "se aprieta L2" en los cuadros de NESNET_SHOTF=a,b,c (hasta 8) */
+static uint32_t g_shot_at[8] = { NO_FRAME, NO_FRAME, NO_FRAME, NO_FRAME, NO_FRAME, NO_FRAME, NO_FRAME, NO_FRAME };
+static int shot_pressed(int prime, uint32_t frame)
+{
+    int k;
+    if (prime) return 0;
+    for (k = 0; k < 8; k++) if (frame == g_shot_at[k]) return 1;
+    return 0;
+}
+static void shot_geometry(int *dw, int *dh, int *z) { *dw = 1280; *dh = 720; *z = 3; }
 
 /* Capturas de prueba: NESNET_SHOTDIR=carpeta NESNET_SHOTS=3,40,90 (numeros de present()) */
 static void dump_ppm(const char *path);
@@ -1436,6 +1465,7 @@ static void video_cb(const void *data, unsigned w, unsigned h, size_t pitch)
     unsigned x, y, ox, oy;
     uint32_t hsh = 2166136261u;
     if (!data) return;                      /* frame repetido: no hay cambios */
+    g_vid_fresh = 1;
     if (w > SCR_W) w = SCR_W;
     if (h > SCR_H) h = SCR_H;
     ox = (SCR_W - w) / 2;
@@ -1828,6 +1858,157 @@ static int state_read(int slot, uint8_t **buf, size_t *n)
     *buf = b;
     *n = fsz;
     return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* v1.9.6: CAPTURA DE PANTALLA (L2 del mando 1) -> USRDIR/screenshots/<ROM>_NNNN.png                                  */
+/* Sale LIMPIA (solo el juego: sin FPS, info de red, avisos ni marco) y del tamano de la pantalla elegida en OPCIONES    */
+/* (ORIGINAL 768x720, 4:3 960x720, 16:9 1280x720 en 720p), con el mismo escalado de canvas_blit_cpu, pero SIN el ajuste   */
+/* de imagen (tamano / desplazamiento del overscan). Se toma justo despues de emular el cuadro, antes de dibujar textos.   */
+/* PNG propio sin librerias: bloques "stored" de deflate (sin compresion), una fila por bloque, escrito en streaming       */
+/* (no reserva memoria para la imagen). Solo es local: no toca la red ni el juego (en online cada consola captura lo suyo). */
+/* ------------------------------------------------------------------ */
+static void shot_geometry(int *dw, int *dh, int *z);
+
+static uint32_t g_png_tab[256];
+static int      g_png_tab_ok;
+
+static uint32_t png_crc_upd(uint32_t c, const uint8_t *d, size_t n)
+{
+    if (!g_png_tab_ok) {
+        uint32_t i;
+        int k;
+        for (i = 0; i < 256; i++) {
+            uint32_t v = i;
+            for (k = 0; k < 8; k++) v = (v & 1u) ? (0xEDB88320u ^ (v >> 1)) : (v >> 1);
+            g_png_tab[i] = v;
+        }
+        g_png_tab_ok = 1;
+    }
+    while (n--) c = g_png_tab[(c ^ *d++) & 0xFFu] ^ (c >> 8);
+    return c;
+}
+
+static void png_adler_upd(uint32_t *a, uint32_t *b, const uint8_t *d, size_t n)
+{
+    while (n) {
+        size_t m = n > 5552 ? 5552 : n;
+        n -= m;
+        while (m--) { *a += *d++; *b += *a; }
+        *a %= 65521u;
+        *b %= 65521u;
+    }
+}
+
+static void png_be32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
+
+/* Escribe el lienzo 'fb' (256x240) como PNG RGB escalado igual que canvas_blit_cpu (modo mode, ancho de pantalla dw, vertical z).
+ * 1 = bien (con el ancho y el alto en outw y outh), 0 = fallo (el archivo parcial se borra) */
+static int shot_write_png(const char *path, const uint32_t *fb, int mode, int dw, int z, int *outw, int *outh)
+{
+    static const uint8_t sig[8]  = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+    static const uint8_t iend[12] = { 0, 0, 0, 0, 'I', 'E', 'N', 'D', 0xAE, 0x42, 0x60, 0x82 };
+    static uint8_t blk[5 + 1 + 3 * COLMAP_MAX];       /* cabecera del bloque (5) + filtro (1) + pixeles RGB */
+    static int cm[COLMAP_MAX];
+    int oh = SCR_H * z, ow = screen_out_w(mode, dw, oh, z);
+    int rowb, x, y, k, ok, row = 0;
+    uint32_t crc, ad_a = 1, ad_b = 0, idat_len;
+    uint8_t hd[41], z2[2], tail[4];
+    FILE *f;
+    if (z < 1 || ow < 1) return 0;
+    rowb = 1 + 3 * ow;
+    for (x = 0; x < ow; x++) cm[x] = x * SCR_W / ow;
+    f = fopen(path, "wb");
+    if (!f) return 0;
+    memcpy(hd, sig, 8);
+    png_be32(hd + 8, 13); memcpy(hd + 12, "IHDR", 4);
+    png_be32(hd + 16, (uint32_t)ow); png_be32(hd + 20, (uint32_t)oh);
+    hd[24] = 8; hd[25] = 2; hd[26] = 0; hd[27] = 0; hd[28] = 0;                 /* 8 bits, RGB, sin interlace */
+    png_be32(hd + 29, ~png_crc_upd(0xFFFFFFFFu, hd + 12, 17));
+    idat_len = 2u + (uint32_t)oh * (uint32_t)(5 + rowb) + 4u;                  /* zlib: 2 de cabecera + bloques + 4 de Adler-32 */
+    png_be32(hd + 33, idat_len); memcpy(hd + 37, "IDAT", 4);
+    ok = fwrite(hd, 1, 41, f) == 41;
+    crc = png_crc_upd(0xFFFFFFFFu, hd + 37, 4);
+    z2[0] = 0x78; z2[1] = 0x01;
+    crc = png_crc_upd(crc, z2, 2);
+    ok = ok && fwrite(z2, 1, 2, f) == 2;
+    blk[5] = 0;                                                                 /* filtro 0 (sin filtro) */
+    for (y = 0; y < SCR_H && ok; y++) {
+        const uint32_t *src = fb + y * SCR_W;
+        uint8_t *p = blk + 6;
+        for (x = 0; x < ow; x++) { uint32_t px = src[cm[x]]; *p++ = (uint8_t)(px >> 16); *p++ = (uint8_t)(px >> 8); *p++ = (uint8_t)px; }
+        for (k = 0; k < z && ok; k++) {
+            row++;
+            blk[0] = (uint8_t)(row == oh ? 1 : 0);                              /* ultimo bloque */
+            blk[1] = (uint8_t)(rowb & 0xFF); blk[2] = (uint8_t)((rowb >> 8) & 0xFF);
+            blk[3] = (uint8_t)(~rowb & 0xFF); blk[4] = (uint8_t)((~rowb >> 8) & 0xFF);
+            ok = fwrite(blk, 1, (size_t)(5 + rowb), f) == (size_t)(5 + rowb);
+            crc = png_crc_upd(crc, blk, (size_t)(5 + rowb));
+            png_adler_upd(&ad_a, &ad_b, blk + 5, (size_t)rowb);
+        }
+    }
+    png_be32(tail, (ad_b << 16) | ad_a);
+    ok = ok && fwrite(tail, 1, 4, f) == 4;
+    crc = png_crc_upd(crc, tail, 4);
+    png_be32(tail, ~crc);
+    ok = ok && fwrite(tail, 1, 4, f) == 4;
+    ok = ok && fwrite(iend, 1, 12, f) == 12;
+    if (fclose(f) != 0) ok = 0;
+    if (!ok) { remove(path); return 0; }
+    if (outw) *outw = ow;
+    if (outh) *outh = oh;
+    return 1;
+}
+
+static char g_shot_last[48];                  /* ROM de la ultima captura y su ultimo numero (para no revisar desde el 1 cada vez) */
+static int  g_shot_n;
+
+/* Guarda la captura de 'fb'. Devuelve el numero de la captura (1..9999) o 0 si fallo */
+static int shot_take(const uint32_t *fb)
+{
+    char dir[320], base[48], path[420], tmp[440];
+    int dw = 1280, dh = 720, z = 3, mode, n, w = 0, h = 0, k = 0;
+    uint32_t t0 = now_ms();
+    size_t len, dot, j;
+    shot_geometry(&dw, &dh, &z);
+    (void)dh;
+    mode = g_cfg.render ? g_screen : 0;       /* con el dibujo por GPU la pantalla siempre es ORIGINAL */
+    snprintf(dir, sizeof dir, "%s/screenshots", g_dir);
+    mkdir(dir, 0777);
+    /* nombre: la ROM sin extension; solo letras, numeros, - y _ (lo demas pasa a _) */
+    len = strlen(g_rom_name);
+    dot = len;
+    for (j = len; j > 0; j--) if (g_rom_name[j - 1] == '.') { dot = j - 1; break; }
+    if (dot == 0) dot = len;
+    for (j = 0; j < dot && k < 40; j++) {
+        char c = g_rom_name[j];
+        base[k++] = (char)(((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '-' || c == '_') ? c : '_');
+    }
+    base[k] = 0;
+    if (!base[0]) snprintf(base, sizeof base, "captura");
+    if (strcmp(base, g_shot_last)) { snprintf(g_shot_last, sizeof g_shot_last, "%s", base); g_shot_n = 0; }
+    for (n = g_shot_n + 1; n < 10000; n++) {
+        snprintf(path, sizeof path, "%s/%s_%04d.png", dir, base, n);
+        if (!path_is_valid(path)) break;
+    }
+    if (n >= 10000) { logf_("AVISO: captura: ya hay 9999 capturas de este juego"); return 0; }
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    if (!shot_write_png(tmp, fb, mode, dw, z, &w, &h)) { logf_("AVISO: captura: no pude escribir %s (errno=%d)", tmp, errno); return 0; }
+    remove(path);
+    if (rename(tmp, path) != 0) { logf_("AVISO: captura: no pude renombrar (queda %s)", tmp); return 0; }
+    g_shot_n = n;
+    logf_("captura: guardada %s (%dx%d, pantalla=%s) en %u ms", path, w, h, screen_names[mode], (unsigned)(now_ms() - t0));
+    return n;
+}
+
+/* Toma la captura de la imagen del juego (g_fb, todavia sin textos) y avisa en pantalla */
+static void shot_do(void)
+{
+    char tb[48];
+    int n = shot_take(g_fb);
+    if (n > 0) snprintf(tb, sizeof tb, "CAPTURA GUARDADA %04d", n);
+    else snprintf(tb, sizeof tb, "NO SE PUDO GUARDAR LA CAPTURA");
+    toast(tb);
 }
 
 static void step_frame(uint16_t p1, uint16_t p2)
@@ -3021,6 +3202,8 @@ static int session_loop(int role, int D, uint32_t maxframes)
 
     (void)exit_pressed(1, 0);               /* ignora un R2 que siga apretado desde antes */
 
+    (void)shot_pressed(1, 0); g_shot_req = 0;          /* v1.9.6: lo mismo con L2 (captura) */
+
     while (g_running && (maxframes == 0 || frame < maxframes)) {
         uint16_t p1, p2;
         pump();
@@ -3064,6 +3247,7 @@ static int session_loop(int role, int D, uint32_t maxframes)
             g_ni_t0 = 0; g_ni_last = 0;               /* v1.9.2: el FPS vuelve a medir despues del menu */
         }
 
+        if (role != -2 && shot_pressed(0, frame)) g_shot_req = 1;        /* v1.9.6: L2 = captura (se toma despues de emular este cuadro) */
         if (role == -1) {
             p1 = local_bits(0, 0, frame);
             p2 = local_bits(1, 1, frame);
@@ -3144,7 +3328,9 @@ static int session_loop(int role, int D, uint32_t maxframes)
         { const char *b = getenv("NESNET_BREAK");        /* prueba: corrompe a proposito un frame */
           if (b && role == 1 && frame >= (uint32_t)atoi(b) && frame < (uint32_t)atoi(b) + 30) p1 ^= 0xFF; }
 #endif
+        g_vid_fresh = 0;
         step_frame(p1, p2);
+        if (g_shot_req && g_vid_fresh) { g_shot_req = 0; shot_do(); }   /* v1.9.6: captura limpia: g_fb todavia no tiene textos */
 
         mine_f[frame % RING] = frame;
         mine_c[frame % RING] = g_frame_crc;
@@ -3237,6 +3423,8 @@ static int session_loop4(int role, int D, uint32_t maxframes)
 
     (void)exit_pressed(1, 0);               /* ignora un R2 que siga apretado desde antes */
 
+    (void)shot_pressed(1, 0); g_shot_req = 0;          /* v1.9.6: lo mismo con L2 (captura) */
+
     while (g_running && (maxframes == 0 || frame < maxframes)) {
         uint16_t p1, p2, p3, p4;
         pump();
@@ -3267,6 +3455,7 @@ static int session_loop4(int role, int D, uint32_t maxframes)
             g_ni_t0 = 0; g_ni_last = 0;               /* v1.9.2: el FPS vuelve a medir despues del menu */
         }
 
+        if (role != -2 && shot_pressed(0, frame)) g_shot_req = 1;        /* v1.9.6: L2 = captura (se toma despues de emular este cuadro) */
         if (role == -2) {
 #ifdef NESNET_HOST
             uint32_t f0 = frame >= (uint32_t)D ? frame - (uint32_t)D : 0;
@@ -3354,7 +3543,9 @@ static int session_loop4(int role, int D, uint32_t maxframes)
         { const char *b = getenv("NESNET_BREAK");        /* prueba: corrompe a proposito un frame */
           if (b && role == 1 && frame >= (uint32_t)atoi(b) && frame < (uint32_t)atoi(b) + 30) p3 ^= 0xFF; }
 #endif
+        g_vid_fresh = 0;
         step_frame4(p1, p2, p3, p4);
+        if (g_shot_req && g_vid_fresh) { g_shot_req = 0; shot_do(); }   /* v1.9.6: captura limpia */
 
         mine_f[frame % RING] = frame;
         mine_c[frame % RING] = g_frame_crc;
@@ -3405,7 +3596,7 @@ out:
 static void ui_show(const char *l1, const char *l2, const char *l3)
 {
     ui_clear();
-    ui_center(20, "NESNET V1.9.5", 2, 0xFFFFD040);
+    ui_center(20, "NESNET V1.9.6", 2, 0xFFFFD040);
     if (l1) ui_center(90, l1, 1, 0xFFFFFFFF);
     if (l2) ui_center(110, l2, 1, 0xFFC0C0FF);
     if (l3) ui_center(130, l3, 1, 0xFFC0C0FF);
@@ -3606,7 +3797,7 @@ static void ui_opt_pad(int port)
         }
         ui_center(176, "IZQ/DER: CAMBIAR (SALTA LOS USADOS)", 1, 0xFFC0C0FF);
         ui_center(190, "TURBO: 15 PULSOS POR SEGUNDO", 1, 0xFFC0C0FF);
-        if (port == 0) ui_center(204, "R3 DEL MANDO 1 ABRE EL MENU", 1, 0xFFFFC040);
+        if (port == 0) ui_center(204, "MANDO 1: R3 = MENU   L2 = CAPTURA", 1, 0xFFFFC040);
         ui_center(218, "O: VOLVER", 1, 0xFF8080A0);
         present();
 #ifdef NESNET_HOST
@@ -3856,7 +4047,7 @@ static int ui_menu(void)
             else return modes[g_menu_sel];
         }
         ui_clear();
-        ui_center(20, "NESNET V1.9.5", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.6", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         if (g_rom) {
             fit_name(nm, sizeof nm, g_rom_name, 34);
@@ -3873,7 +4064,7 @@ static int ui_menu(void)
             ui_center(90 + i * 17, line, 1, col);
         }
         ui_center(196, "ARRIBA/ABAJO + X", 1, 0xFF8080A0);
-        ui_center(209, "EN PARTIDA: R3 = MENU", 1, 0xFF8080A0);
+        ui_center(209, "EN PARTIDA: R3 = MENU   L2 = CAPTURA", 1, 0xFF8080A0);
         ui_center(222, "O: SALIR AL XMB", 1, 0xFF8080A0);
         present();
 #ifdef NESNET_HOST
@@ -3899,7 +4090,7 @@ static int ui_menu4(void)
         if (e & UI_CANCEL) return -1;
         if (e & (UI_OK | UI_START)) return sel == 0 ? MODE_HOST : sel == 1 ? MODE_JOIN : -1;
         ui_clear();
-        ui_center(20, "NESNET V1.9.5", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.6", 2, 0xFFFFD040);
         ui_center(46, "MULTIJUGADOR DE 4 (FOUR SCORE)", 1, 0xFFC0C0FF);
         ui_center(66, "HOST: MANDOS 1 Y 2", 1, 0xFF80FF80);
         ui_center(80, "EL QUE SE UNE: MANDOS 3 Y 4", 1, 0xFF80FF80);
@@ -3909,7 +4100,7 @@ static int ui_menu4(void)
             ui_center(110 + i * 22, line, 1, i == sel ? 0xFFFFFFFF : 0xFF8080A0);
         }
         ui_center(190, "SOLO JUEGOS CON FOUR SCORE", 1, 0xFF8080A0);
-        ui_center(204, "EN PARTIDA: R3 = MENU", 1, 0xFF8080A0);
+        ui_center(204, "EN PARTIDA: R3 = MENU   L2 = CAPTURA", 1, 0xFF8080A0);
         present();
 #ifdef NESNET_HOST
         sleep_ms(16);
@@ -3951,7 +4142,7 @@ static int ui_enter_code(char *out)
             return 1;
         }
         ui_clear();
-        ui_center(20, "NESNET V1.9.5", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.6", 2, 0xFFFFD040);
         ui_center(60, "ESCRIBE EL CODIGO DEL HOST", 1, 0xFFFFFFFF);
         for (i = 0; i < 10; i++) {
             char c[2] = { (char)('0' + d[i]), 0 };
@@ -4053,7 +4244,7 @@ static int run_host_inner(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.9.5", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.6", 2, 0xFFFFD040);
         ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
         { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -4199,7 +4390,7 @@ static int run_host4_inner(void)
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
         ui_clear();
-        ui_center(20, "NESNET V1.9.5", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.6", 2, 0xFFFFD040);
         ui_center(64, "SALA DE 4 - TU CODIGO:", 1, 0xFFFFFFFF);
         { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -4304,7 +4495,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("NesNet v1.9.5 (menu en partida con R3; 6 ranuras de estado; guardar/cargar estado online (host); O sale al XMB; menus siempre a pantalla completa; codigo de sala guardado al unirse) - dir=%s", g_dir);
+    logf_("NesNet v1.9.6 (L2 = captura de pantalla limpia en PNG; menu en partida con R3; 6 ranuras de estado; guardar/cargar estado online (host); O sale al XMB; menus siempre a pantalla completa; codigo de sala guardado al unirse) - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
@@ -4433,7 +4624,7 @@ int main(int argc, char **argv)
         static const char *items[3] = { "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS" };
         int i;
         ui_clear();
-        ui_center(20, "NESNET V1.9.5", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.6", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         for (i = 0; i < 3; i++) {
             char line[40];
@@ -4445,7 +4636,7 @@ int main(int argc, char **argv)
             char code[20];
             code_encode(((uint32_t)181 << 24) | (45u << 16) | (200u << 8) | 17u, 7777, code);
             ui_clear();
-            ui_center(20, "NESNET V1.9.5", 2, 0xFFFFD040);
+            ui_center(20, "NESNET V1.9.6", 2, 0xFFFFD040);
             ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
             { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
             ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -4467,6 +4658,13 @@ int main(int argc, char **argv)
     if (getenv("NESNET_R2B")) g_exit_at2 = (uint32_t)atoi(getenv("NESNET_R2B"));
     if (getenv("NESNET_NETINFO")) g_netinfo = atoi(getenv("NESNET_NETINFO"));   /* prueba: modo de info de red */
     if (getenv("NESNET_FPS")) g_showfps = atoi(getenv("NESNET_FPS"));           /* prueba v1.9.2: FPS en pantalla */
+    if (getenv("NESNET_SCREEN")) g_screen = atoi(getenv("NESNET_SCREEN"));       /* prueba v1.9.6: pantalla ORIGINAL / 4:3 / 16:9 (0, 1, 2) */
+    if (getenv("NESNET_SHOTF")) {                                                /* prueba v1.9.6: "se aprieta L2" en estos cuadros (a,b,c) */
+        const char *sl = getenv("NESNET_SHOTF");
+        int si = 0;
+        while (*sl && si < 8) { g_shot_at[si++] = (uint32_t)atoi(sl); while (*sl && *sl != ',') sl++; if (*sl == ',') sl++; }
+        g_cfg.render = 1;
+    }
     if (getenv("NESNET_RESET_REF")) {                                            /* prueba v1.9.1: reinicios de la referencia "a" o "a,b" */
         const char *rr = getenv("NESNET_RESET_REF");
         g_ref_reset[0] = (uint32_t)atoi(rr);
@@ -4605,8 +4803,8 @@ int main(int argc, char **argv)
                 opts_defaults();
                 memset(seen, 0, sizeof seen);
                 for (k = 0; k < 40; k++) { map_cycle((int)p, MA_TA, +1); seen[g_map[p][MA_TA] + 1]++; }
-                if (p == 0 && seen[PB_R3 + 1] != 0) rb++;
-                if (p == 1 && seen[PB_R3 + 1] == 0) rb++;
+                if (p == 0 && (seen[PB_R3 + 1] != 0 || seen[PB_L2 + 1] != 0)) rb++;   /* v1.9.6: R3 y L2 reservados en el mando 1 */
+                if (p == 1 && (seen[PB_R3 + 1] == 0 || seen[PB_L2 + 1] == 0)) rb++;
                 if (seen[0] == 0) rb++;                                       /* "sin asignar" tambien se alcanza */
                 if (seen[PB_CROSS + 1] != 0 || seen[PB_CIRCLE + 1] != 0 || seen[PB_START + 1] != 0 || seen[PB_SELECT + 1] != 0) rb++;   /* nunca pisa botones usados */
             }
@@ -4620,6 +4818,10 @@ int main(int argc, char **argv)
                 if (!map_valid(ok, 0) || !map_valid(ok, 1)) rb++;
                 if (map_valid(dup, 0) || map_valid(non, 0) || map_valid(r2, 0) || map_valid(big, 1)) rb++;
                 if (!map_valid(r2, 1)) rb++;                                  /* R3 vale en el mando 2 */
+                {   /* v1.9.6: L2 reservado en el mando 1 (captura), libre en el mando 2 */
+                    int l2m[MA_COUNT] = { PB_L2, PB_CROSS, PB_SELECT, PB_START, PB_NONE, PB_NONE };
+                    if (map_valid(l2m, 0) || !map_valid(l2m, 1)) rb++;
+                }
             }
             printf("maptest reglas: bad=%u\n", rb);
             bad += rb;
@@ -4753,6 +4955,66 @@ int main(int argc, char **argv)
             bad += ob;
         }
         printf("imgtest TOTAL mal=%u\n", bad);
+        return bad != 0;
+    } else if (!strcmp(mode, "shottest")) {
+        /* v1.9.6: el PNG de captura == lo que dibuja canvas_blit_cpu (la funcion de la pantalla de la PS3) recortado a la imagen.
+         * argv[4] = carpeta de salida: para cada medida y modo deja ref_<d>_<m>.rgb (lo esperado) y png_<d>_<m>.png (lo guardado). */
+        static const int dims[3][3] = { { 1280, 720, 3 }, { 1920, 1080, 3 }, { 720, 480, 2 } };
+        static uint32_t fbuf[SCR_W * SCR_H], buf[1920 * 1080];
+        const char *od = argc > 4 ? argv[4] : "/tmp";
+        unsigned bad = 0;
+        int di, md, x, y;
+        for (y = 0; y < SCR_H; y++)
+            for (x = 0; x < SCR_W; x++) {
+                uint32_t v = (uint32_t)(x * 7919 + y * 104729 + (x ^ y) * 31);
+                fbuf[y * SCR_W + x] = 0xFF000000u | ((v * 2654435761u) >> 8);
+            }
+        for (di = 0; di < 3; di++)
+            for (md = 0; md < 3; md++) {
+                int dw = dims[di][0], dh = dims[di][1], z = dims[di][2];
+                int oh = SCR_H * z, ow = screen_out_w(md, dw, oh, z), ox = (dw - ow) / 2, oy = (dh - oh) / 2, w = 0, h = 0;
+                unsigned fc = 0;
+                char p1[400];
+                FILE *f;
+                size_t i;
+                for (i = 0; i < (size_t)dw * dh; i++) buf[i] = 0xDEADBEEFu;
+                canvas_blit_cpu(buf, dw, dh, md, z, fbuf, &fc);
+                snprintf(p1, sizeof p1, "%s/ref_%d_%d.rgb", od, di, md);
+                f = fopen(p1, "wb");
+                for (y = 0; y < oh; y++)
+                    for (x = 0; x < ow; x++) {
+                        uint32_t px = buf[(size_t)(oy + y) * dw + ox + x];
+                        uint8_t c3[3] = { (uint8_t)(px >> 16), (uint8_t)(px >> 8), (uint8_t)px };
+                        fwrite(c3, 1, 3, f);
+                    }
+                fclose(f);
+                snprintf(p1, sizeof p1, "%s/png_%d_%d.png", od, di, md);
+                if (!shot_write_png(p1, fbuf, md, dw, z, &w, &h) || w != ow || h != oh) { bad++; printf("shottest: FALLO %dx%d modo %d\n", dw, dh, md); }
+                else printf("shottest %dx%d modo %d: png %dx%d\n", dw, dh, md, w, h);
+            }
+        /* nombres: ROM con espacios, parentesis y corchetes; numeracion 0001, 0002...; otra ROM empieza de nuevo */
+        {
+            char nd[300], p2[420];
+            int n1, n2, n3;
+            snprintf(nd, sizeof nd, "%s/naming", od);
+            mkdir(nd, 0777);
+            snprintf(g_dir, sizeof g_dir, "%s", nd);
+            g_cfg.render = 1; g_screen = 2;
+            snprintf(g_rom_name, sizeof g_rom_name, "Super Mario Bros. 3 (USA) [!].nes");
+            n1 = shot_take(fbuf); n2 = shot_take(fbuf);
+            snprintf(g_rom_name, sizeof g_rom_name, "Otro Juego.nes");
+            n3 = shot_take(fbuf);
+            snprintf(g_rom_name, sizeof g_rom_name, "Super Mario Bros. 3 (USA) [!].nes");
+            if (shot_take(fbuf) != 3) bad++;                                       /* vuelve a la primera ROM: sigue en 0003 */
+            snprintf(p2, sizeof p2, "%s/screenshots/Super_Mario_Bros__3__USA______0003.png", nd);
+            if (n1 != 1 || n2 != 2 || n3 != 1 || !path_is_valid(p2)) { bad++; printf("shottest: numeracion/nombres MAL (%d %d %d) %s\n", n1, n2, n3, p2); }
+            else printf("shottest nombres OK: %s\n", p2);
+            g_rom_name[0] = 0;
+            if (shot_take(fbuf) != 1) bad++;
+            snprintf(p2, sizeof p2, "%s/screenshots/captura_0001.png", nd);
+            if (!path_is_valid(p2)) { bad++; printf("shottest: sin nombre de ROM deberia ser captura_0001.png\n"); }
+        }
+        printf("shottest TOTAL bad=%u\n", bad);
         return bad != 0;
     } else if (!strcmp(mode, "screentest")) {
         /* v1.8.2: pruebas del escalado de pantalla (canvas_blit_cpu, la misma funcion que usa la PS3) */
