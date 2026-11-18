@@ -2009,11 +2009,6 @@ static void hr_init(void)
     if (g_hr_ready) return;
     hr_b64();
     hr_make_bg();
-    memcpy(g_hr, g_bg, sizeof g_hr);              /* el fondo ya con el cuadro del borde: cada cuadro de menu solo lo copia */
-    hr_rect(16, 16, HR_W - 16, HR_H - 16, 0xFF040818u, 70);
-    hr_frame_rect(16, 16, HR_W - 16, HR_H - 16, 3, HC_GRID);
-    hr_frame_rect(22, 22, HR_W - 22, HR_H - 22, 1, 0xFF182C6Eu);
-    memcpy(g_bg, g_hr, sizeof g_hr);
     g_hr_ready = 1;
 }
 
@@ -2035,19 +2030,24 @@ static const FGlyph *hr_glyph(int sz, int cp)
     return NULL;
 }
 
-static int hr_cp(int sz, const char *s)
+/* siguiente caracter UTF-8 (solo 1 y 2 bytes: ASCII y Latin-1: acentos, n con tilde, signos de apertura) */
+static int hr_next(int sz, const char **ps)
 {
-    int c = (unsigned char)*s;
-    if (c < 32 || c > 126) c = '?';
+    const unsigned char *p = (const unsigned char *)*ps;
+    int c = *p++;
+    if (c >= 0xC2 && c <= 0xC3 && (*p & 0xC0) == 0x80) { c = ((c & 0x1F) << 6) | (*p & 0x3F); p++; }
+    else if (c >= 0x80) c = '?';
+    if (c < 32 || (c > 126 && c < 0xA0)) c = '?';
     if ((sz == FS_H || sz == FS_X) && c >= 'a' && c <= 'z') c -= 32;
+    *ps = (const char *)p;
     return c;
 }
 
 static int hr_tw(const char *s, int sz)
 {
     int w = 0;
-    for (; *s; s++) {
-        const FGlyph *g = hr_glyph(sz, hr_cp(sz, s));
+    while (*s) {
+        const FGlyph *g = hr_glyph(sz, hr_next(sz, &s));
         w += g ? g->adv : fg_asc[sz] / 3;
     }
     return w;
@@ -2082,8 +2082,8 @@ static void hr_glyph_draw(int x, int base, const FGlyph *g, uint32_t col)
 static int hr_text(int x, int base, const char *s, int sz, uint32_t col, int shadow)
 {
     int x0 = x;
-    for (; *s; s++) {
-        const FGlyph *g = hr_glyph(sz, hr_cp(sz, s));
+    while (*s) {
+        const FGlyph *g = hr_glyph(sz, hr_next(sz, &s));
         if (g) {
             if (shadow) hr_glyph_draw(x + shadow, base + shadow, g, HC_SHAD);
             hr_glyph_draw(x, base, g, col);
@@ -2201,6 +2201,113 @@ static void hr_vol_bar(int y, int n)
         hr_rect(x0 + i * 66, yc - 15, x0 + i * 66 + 56, yc + 15, i < n ? HC_GREEN : 0xFF28368Au, 256);
 }
 
+/* ---- piezas de los disenos aprobados (logo a la izquierda, cuadros, filas con barra roja, botones X / O abajo) ---- */
+typedef struct { const char *b; const char *t; uint32_t c; } HHint;
+#define HC_BX 0xFF3460D2u            /* boton X (azul) */
+#define HC_BO 0xFFDE263Au            /* boton O (rojo) */
+#define HC_BG 0xFF46466Eu            /* otros botones */
+
+static void hr_px(int x, int y, uint32_t col, int a)
+{
+    uint32_t *d;
+    int r, g, b;
+    if (x < 0 || y < 0 || x >= HR_W || y >= HR_H) return;
+    d = &g_hr[y * HR_W + x];
+    r = (int)((*d >> 16) & 255); g = (int)((*d >> 8) & 255); b = (int)(*d & 255);
+    r = (r * (256 - a) + (int)((col >> 16) & 255) * a) >> 8;
+    g = (g * (256 - a) + (int)((col >> 8) & 255) * a) >> 8;
+    b = (b * (256 - a) + (int)(col & 255) * a) >> 8;
+    *d = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
+static void hr_disc(int cx, int cy, int r, uint32_t col)      /* circulo relleno con borde suave */
+{
+    int x, y;
+    for (y = cy - r - 1; y <= cy + r + 1; y++)
+        for (x = cx - r - 1; x <= cx + r + 1; x++) {
+            int d2 = (x - cx) * (x - cx) + (y - cy) * (y - cy);
+            if (d2 <= (r - 1) * (r - 1)) hr_px(x, y, col, 256);
+            else if (d2 <= r * r) hr_px(x, y, col, 160);
+        }
+}
+
+static int hr_badge(int x, int y, const char *label, uint32_t col)   /* devuelve el ancho */
+{
+    int w = 34, tw = hr_tw(label, FS_S);
+    if (tw > 20) w = tw + 24;
+    hr_disc(x + 17, y + 17, 17, HC_WHITE);
+    hr_disc(x + 17, y + 17, 15, col);
+    if (w > 34) {
+        hr_disc(x + w - 17, y + 17, 17, HC_WHITE);
+        hr_rect(x + 17, y, x + w - 17, y + 34, HC_WHITE, 256);
+        hr_disc(x + w - 17, y + 17, 15, col);
+        hr_rect(x + 17, y + 2, x + w - 17, y + 32, col, 256);
+    }
+    hr_text(x + (w - tw) / 2, y + 25, label, FS_S, HC_WHITE, 0);
+    return w;
+}
+
+static void hr_hints(const HHint *h, int n)
+{
+    int i, total = 0, x, y = 668;
+    for (i = 0; i < n; i++) total += (hr_tw(h[i].b, FS_S) > 20 ? hr_tw(h[i].b, FS_S) + 24 : 34) + 10 + hr_tw(h[i].t, FS_S);
+    total += 44 * (n - 1);
+    x = (HR_W - total) / 2;
+    for (i = 0; i < n; i++) {
+        int bw = hr_badge(x, y, h[i].b, h[i].c);
+        x += bw + 10;
+        x += hr_text(x, y + 25, h[i].t, FS_S, HC_DIM, 2) + 44;
+    }
+}
+
+/* fondo + logo a la izquierda (barra roja, NES blanco, NET rojo, version) + subtitulo */
+static void hr_head(const char *sub)
+{
+    int x = 96, base = 128;
+    hr_begin();
+    hr_rect(70, 52, 82, 144, HC_RED, 256);
+    x += hr_text(x, base, "NES", FS_X, HC_WHITE, 4);
+    x += hr_text(x, base, "NET", FS_X, HC_RED, 4);
+    hr_text(x + 16, base + 4, "v1.9.7", FS_S, HC_DIM, 2);
+    if (sub) hr_text(98, 172, sub, FS_M, HC_DIM, 2);
+}
+
+/* filas del menu: barra roja con flecha en la marcada; 'dis' = bits de filas apagadas (bloqueadas) */
+static void hr_rows(int x, int y, int w, const char *const *rows, int n, int sel, unsigned dis, int rh)
+{
+    int i, bh = rh - 8;
+    for (i = 0; i < n; i++) {
+        int yy = y + i * rh, base = yy + bh / 2 + 12;
+        if (i == sel) {
+            hr_rect(x, yy, x + w, yy + bh, HC_RED, 256);
+            hr_tri(x + 16, yy + bh / 2, 22);
+            hr_text(x + 52, base, rows[i], FS_L, HC_WHITE, 2);
+        } else {
+            hr_text(x + 52, base, rows[i], FS_L, (dis >> i) & 1 ? HC_MUTE : HC_DIM, 2);
+        }
+    }
+}
+
+static void hr_textc(int cx, int base, const char *s, int sz, uint32_t col) { hr_text(cx - hr_tw(s, sz) / 2, base, s, sz, col, 2); }
+
+static void hr_arrow(int cx, int cy, int up)       /* triangulo chico para "hay mas arriba / abajo" */
+{
+    int r;
+    for (r = 0; r < 14; r++) {
+        int half = up ? r : 13 - r;
+        hr_rect(cx - half, cy - 7 + r, cx + half + 1, cy - 6 + r, HC_DIM, 256);
+    }
+}
+
+/* fila "NOMBRE ... VALOR" con barra roja si esta marcada; el valor empieza en x + vx */
+static void hr_row2(int x, int y, int w, int rh, const char *nm, const char *val, int sel, int vx)
+{
+    int bh = rh - 8, base = y + bh / 2 + 12;
+    if (sel) { hr_rect(x, y, x + w, y + bh, HC_RED, 256); hr_tri(x + 16, y + bh / 2, 22); }
+    hr_text(x + 52, base, nm, FS_L, sel ? HC_WHITE : HC_DIM, 2);
+    if (val) hr_text(x + vx, base, val, FS_L, sel ? HC_WHITE : HC_DIM, 2);
+}
+
 /* Fondo del menu R3 en partida: la imagen del juego (16:9) oscurecida + un cuadro al centro */
 static uint32_t g_bd[HR_W * HR_H];         /* fondo del menu R3 (juego oscurecido + cuadro), se arma una vez por apertura */
 static int      g_bd_dirty;
@@ -2213,10 +2320,11 @@ static void hr_backdrop(const uint32_t *fb)
             const uint32_t *src = fb + (y / 3) * SCR_W;
             for (x = 0; x < HR_W; x++) {
                 uint32_t c = src[x / 5];
-                g_hr[y * HR_W + x] = 0xFF000000u | ((c >> 2) & 0x003F3F3Fu) | 0x00040818u;
+                uint32_t v = ((((c >> 16) & 255) + ((c >> 8) & 255) + (c & 255)) / 3) >> 2;     /* gris al 25 % */
+                g_hr[y * HR_W + x] = 0xFF000000u | (v << 16) | (v << 8) | v | 0x00020410u;
             }
         }
-        hr_panel(200, 130, HR_W - 200, 590);
+        hr_panel(290, 120, 990, 610);
         memcpy(g_bd, g_hr, sizeof g_hr);
         g_bd_dirty = 0;
     }
@@ -4744,7 +4852,50 @@ static int solo_menu(int online, int host)
         for (y = 46; y < 198; y++)
             for (x = 20; x < 236; x++)
                 g_fb[y * SCR_W + x] = (y < 48 || y >= 196 || x < 22 || x >= 234) ? 0xFFFFFFFF : 0xFF101838;
-        if (confirm >= 0) {
+        if (g_hr_on) {
+            static const HHint hs[2] = { { "X", "ELEGIR", HC_BX }, { "O", "SEGUIR", HC_BO } };
+            static const HHint hc[2] = { { "X", "SÍ", HC_BX }, { "O", "NO", HC_BO } };
+            if (confirm >= 0) {
+                char l[48];
+                const char *m2 = NULL, *m3 = NULL;
+                uint32_t c2 = HC_DIM;
+                if (confirm == MK_RESET) { snprintf(l, sizeof l, "¿REINICIAR EL JUEGO?"); m2 = online ? "Se reinicia para los dos" : "Lo guardado no se borra"; if (online) c2 = HC_AMBER; }
+                else if (confirm == MK_EXIT) { snprintf(l, sizeof l, "¿SALIR DE LA PARTIDA?"); if (online) { m2 = "Termina la partida para los dos"; c2 = HC_AMBER; } }
+                else if (confirm == MK_SAVE) snprintf(l, sizeof l, "¿SOBREESCRIBIR LA RANURA %d?", g_state_slot + 1);
+                else {
+                    snprintf(l, sizeof l, "¿CARGAR LA RANURA %d?", g_state_slot + 1);
+                    m2 = online ? "Se pierde lo que llevan los dos" : "Se pierde lo que llevas"; c2 = HC_AMBER;
+                    if (online) m3 = "Se envía al amigo (tarda unos segundos)";
+                }
+                hr_textc(640, 330, l, FS_L, HC_WHITE);
+                if (m2) hr_textc(640, 392, m2, FS_M, c2);
+                if (m3) hr_textc(640, 436, m3, FS_S, HC_DIM);
+                hr_hints(hc, 2);
+            } else {
+                const char *rows[6];
+                char rl[6][48];
+                const char *hl = NULL;
+                for (i = 0; i < nk; i++) {
+                    switch (kinds[i]) {
+                    case MK_CONT:  snprintf(rl[i], sizeof rl[i], "CONTINUAR"); break;
+                    case MK_SAVE:  snprintf(rl[i], sizeof rl[i], "GUARDAR ESTADO < %d >", g_state_slot + 1); break;
+                    case MK_LOAD:  snprintf(rl[i], sizeof rl[i], "CARGAR ESTADO < %d >%s", g_state_slot + 1, ex[g_state_slot] ? "" : " (vacía)"); break;
+                    case MK_GAME:  snprintf(rl[i], sizeof rl[i], "CAMBIAR DE JUEGO"); break;
+                    case MK_RESET: snprintf(rl[i], sizeof rl[i], "REINICIAR EL JUEGO"); break;
+                    default:       snprintf(rl[i], sizeof rl[i], "SALIR DE LA PARTIDA"); break;
+                    }
+                    rows[i] = rl[i];
+                }
+                hr_text(322, 176, "MENÚ", FS_H, HC_YEL, 3);
+                hr_rows(312, 200, 656, rows, nk, sel, 0, 56);
+                if (kinds[sel] == MK_SAVE || kinds[sel] == MK_LOAD) hl = "IZQ/DER: cambiar de ranura";
+                else if (online && kinds[sel] == MK_GAME) hl = "Se le pregunta antes a tu amigo";
+                else if (online) hl = "Reiniciar y salir: para los dos";
+                if (note) hr_text(322, 580, "Esa ranura está vacía", FS_S, HC_AMBER, 2);
+                else if (hl) hr_text(322, 580, hl, FS_S, HC_DIM, 2);
+                hr_hints(hs, 2);
+            }
+        } else if (confirm >= 0) {
             char l[40];
             if (confirm == MK_RESET) {
                 ui_center(88, "REINICIAR EL JUEGO?", 1, 0xFFFFFFFF);
@@ -5485,8 +5636,37 @@ out:
 /* ------------------------------------------------------------------ */
 /* Interfaz                                                            */
 /* ------------------------------------------------------------------ */
+static void code_pretty(const char *code, char *out);
+/* v1.9.7: pantalla de "sala creada" (codigo, estado del puerto, esperando al amigo) */
+static void hr_room_screen(const char *sub, const char *code, const char *l2, const char *l3, uint32_t col3)
+{
+    static const HHint hh[1] = { { "O", "CANCELAR", HC_BO } };
+    char pc[24];
+    int dots = (int)((now_ms() / 400) % 3), k;
+    code_pretty(code, pc);
+    hr_head(sub);
+    hr_panel(230, 200, 1050, 600);
+    hr_text(270, 252, "TU CÓDIGO DE SALA", FS_M, HC_DIM, 2);
+    hr_text(270, 350, pc, FS_X, HC_YEL, 4);
+    hr_text(270, 410, "Dáselo a tu amigo", FS_L, HC_WHITE, 2);
+    hr_text(270, 452, l3, FS_M, hr_col(col3), 2);
+    hr_text(270, 486, l2, FS_S, HC_DIM, 2);
+    hr_text(270, 552, "Esperando al amigo...", FS_L, HC_WHITE, 2);
+    for (k = 0; k < 3; k++) hr_rect(760 + k * 34, 534, 782 + k * 34, 556, k == dots ? HC_RED : 0xFF5A283Cu, 256);
+    hr_hints(hh, 1);
+}
+
 static void ui_show(const char *l1, const char *l2, const char *l3)
 {
+    if (hr_usable()) {
+        hr_head(NULL);
+        hr_panel(230, 250, 1050, 480);
+        if (l1) hr_textc(640, 340, l1, FS_L, HC_WHITE);
+        if (l2) hr_textc(640, 396, l2, FS_M, HC_DIM);
+        if (l3) hr_textc(640, 438, l3, FS_M, HC_DIM);
+        present();
+        return;
+    }
     ui_clear();
     ui_center(20, "NESNET V1.9.7", 2, 0xFFFFD040);
     if (l1) ui_center(90, l1, 1, 0xFFFFFFFF);
@@ -5577,6 +5757,46 @@ static int ui_rom_select(int pick_only)
                 if (read_whole_file(rp, &b, &bs)) { g_roms[sel].crc = crc32_buf(b, bs); g_roms[sel].has_crc = 1; free(b); }
             }
         }
+        if (hr_usable()) {
+            static const HHint hh1[3] = { { "<>", "SALTAR 10", HC_BG }, { "X", "ELEGIR", HC_BX }, { "O", "VOLVER", HC_BO } };
+            static const HHint hh0[1] = { { "O", "VOLVER", HC_BO } };
+            hr_begin();
+            hr_text(70, 100, "ELEGIR ROM", FS_H, HC_WHITE, 3);
+            if (g_nroms == 0) {
+                hr_panel(70, 130, 1210, 400);
+                hr_text(110, 200, "NO HAY ROMS EN LA CARPETA:", FS_L, HC_WHITE, 2);
+                hr_text(110, 250, "NESN00001/USRDIR/roms", FS_L, HC_YEL, 2);
+                hr_text(110, 310, "Pon ahí tus ROMs de NES y vuelve a entrar aquí.", FS_M, HC_DIM, 2);
+                hr_hints(hh0, 1);
+            } else {
+                snprintf(line, sizeof line, "%d / %d", sel + 1, g_nroms);
+                hr_text(1210 - hr_tw(line, FS_L), 84, line, FS_L, HC_DIM, 2);
+                hr_panel(70, 124, 1210, 558);
+                for (i = 0; i < VIS && top + i < g_nroms; i++) {
+                    int k = top + i, yy = 138 + i * 46;
+                    fit_name(nm, sizeof nm, g_roms[k].name, 52);
+                    if (k == sel) {
+                        hr_rect(86, yy, 1194, yy + 42, HC_RED, 256);
+                        hr_tri(100, yy + 21, 22);
+                        hr_text(132, yy + 31, nm, FS_L, HC_WHITE, 2);
+                    } else hr_text(132, yy + 31, nm, FS_L, HC_DIM, 2);
+                }
+                if (top > 0) hr_arrow(1176, 156, 1);
+                if (top + VIS < g_nroms) hr_arrow(1176, 536, 0);
+                hr_panel(70, 568, 1210, 656);
+                fit_name(nm, sizeof nm, g_roms[sel].name, 60);
+                hr_text(96, 604, nm, FS_M, HC_YEL, 2);
+                if (g_roms[sel].has_crc) snprintf(line, sizeof line, "%u KB     CRC32 %08X", (unsigned)((g_roms[sel].size + 512) / 1024), (unsigned)g_roms[sel].crc);
+                else snprintf(line, sizeof line, "%u KB     CRC32 ........", (unsigned)((g_roms[sel].size + 512) / 1024));
+                hr_text(96, 640, line, FS_S, HC_DIM, 2);
+                hr_hints(hh1, 3);
+            }
+            present();
+#ifdef NESNET_HOST
+            sleep_ms(16);
+#endif
+            continue;
+        }
         ui_clear();
         ui_center(14, "ELEGIR ROM", 2, 0xFFFFD040);
         if (g_nroms == 0) {
@@ -5633,6 +5853,19 @@ static void ui_opt_screen(void)
         if (e & UI_UP)   { g_screen = (g_screen + 2) % 3; opts_save(); }
         if (e & UI_DOWN) { g_screen = (g_screen + 1) % 3; opts_save(); }
         if (e & (UI_OK | UI_CANCEL | UI_START)) break;
+        if (hr_usable()) {
+            static const HHint hh[2] = { { "X", "VOLVER", HC_BX }, { "O", "VOLVER", HC_BO } };
+            hr_head("PANTALLA  ·  solo cambia la imagen del juego");
+            hr_panel(70, 210, 900, 480);
+            hr_rows(96, 232, 778, screen_names, 3, g_screen, 0, 58);
+            hr_text(96, 446, desc[g_screen], FS_M, HC_GREEN, 2);
+            hr_hints(hh, 2);
+            present();
+#ifdef NESNET_HOST
+            sleep_ms(16);
+#endif
+            continue;
+        }
         ui_clear();
         ui_center(20, "PANTALLA", 2, 0xFFFFD040);
         ui_center(46, "SOLO CAMBIA LA IMAGEN DEL JUEGO", 1, 0xFFC0C0FF);
@@ -5675,6 +5908,36 @@ static void ui_opt_pad(int port)
             if (sel == 6) { map_defaults(port); opts_save(); }
             else break;
         }
+        if (hr_usable()) {
+            static const HHint hh[1] = { { "O", "VOLVER", HC_BO } };
+            char sub[48];
+            snprintf(sub, sizeof sub, "MANDO %d  ·  botones y turbo", port + 1);
+            hr_head(sub);
+            hr_panel(70, 206, 880, 606);
+            for (i = 0; i < 8; i++) {
+                const char *nm = i < MA_COUNT ? ma_names[i] : (i == 6 ? "RESTAURAR ESTE MANDO" : "VOLVER");
+                const char *vv = i < MA_COUNT ? (g_map[port][i] == PB_NONE ? "NO" : pb_names[g_map[port][i]]) : NULL;
+                hr_row2(86, 222 + i * 46, 780, 46, nm, vv, i == sel, 330);
+            }
+            hr_panel(910, 206, 1210, 606);
+            hr_text(934, 252, "IZQ/DER", FS_M, HC_YEL, 2);
+            hr_text(934, 290, "cambia el botón", FS_S, HC_DIM, 2);
+            hr_text(934, 322, "(salta los usados)", FS_S, HC_DIM, 2);
+            hr_text(934, 388, "TURBO", FS_M, HC_YEL, 2);
+            hr_text(934, 426, "15 pulsos por", FS_S, HC_DIM, 2);
+            hr_text(934, 458, "segundo", FS_S, HC_DIM, 2);
+            if (port == 0) {
+                hr_text(934, 524, "MANDO 1", FS_M, HC_AMBER, 2);
+                hr_text(934, 562, "R3 = menú", FS_S, HC_AMBER, 2);
+                hr_text(934, 594, "L2 = captura", FS_S, HC_AMBER, 2);
+            }
+            hr_hints(hh, 1);
+            present();
+#ifdef NESNET_HOST
+            sleep_ms(16);
+#endif
+            continue;
+        }
         ui_clear();
         snprintf(title, sizeof title, "MANDO %d", port + 1);
         ui_center(14, title, 2, 0xFFFFD040);
@@ -5716,6 +5979,19 @@ static void ui_opt_pads(void)
             else if (sel == 2) { map_defaults(0); map_defaults(1); opts_save(); }
             else break;
         }
+        if (hr_usable()) {
+            static const HHint hh[2] = { { "X", "ENTRAR", HC_BX }, { "O", "VOLVER", HC_BO } };
+            hr_head("MANDOS  ·  botones y turbo de cada mando");
+            hr_panel(70, 210, 900, 540);
+            hr_rows(96, 232, 778, items, 4, sel, 0, 58);
+            hr_text(96, 512, "Vale para SOLO, 1 vs 1 y 4 jugadores", FS_S, HC_DIM, 2);
+            hr_hints(hh, 2);
+            present();
+#ifdef NESNET_HOST
+            sleep_ms(16);
+#endif
+            continue;
+        }
         ui_clear();
         ui_center(20, "MANDOS", 2, 0xFFFFD040);
         ui_center(46, "BOTONES Y TURBO DE CADA MANDO", 1, 0xFFC0C0FF);
@@ -5747,6 +6023,27 @@ static void ui_opt_sound(void)
         if (e & (UI_LEFT | UI_DOWN))  { g_volume = g_volume - 10 < 0 ? 0 : g_volume - 10; opts_save(); }
         if (e & (UI_RIGHT | UI_UP))   { g_volume = g_volume + 10 > 100 ? 100 : g_volume + 10; opts_save(); }
         if (e & (UI_OK | UI_CANCEL | UI_START)) break;
+        if (hr_usable()) {
+            static const HHint hh[2] = { { "<>", "CAMBIAR", HC_BG }, { "O", "VOLVER", HC_BO } };
+            char num[12];
+            int nx;
+            hr_head("SONIDO  ·  volumen");
+            hr_panel(230, 210, 1050, 560);
+            hr_text(270, 262, "VOLUMEN", FS_M, HC_DIM, 2);
+            snprintf(num, sizeof num, "%d", g_volume);
+            nx = 270 + hr_text(270, 360, num, FS_X, HC_YEL, 4);
+            hr_text(nx + 8, 360, "%", FS_H, HC_YEL, 3);
+            for (i = 0; i < 10; i++)
+                hr_rect(270 + i * 76, 392, 270 + i * 76 + 66, 428, i < g_volume / 10 ? HC_GREEN : 0xFF28368Au, 256);
+            hr_text(270, 484, g_volume == 0 ? "Silencio" : "100 % es el volumen de siempre", FS_S, HC_DIM, 2);
+            if (!g_cfg.audio) hr_text(270, 524, "AVISO: SONIDO APAGADO (R2 AL ABRIR)", FS_S, HC_AMBER, 2);
+            hr_hints(hh, 2);
+            present();
+#ifdef NESNET_HOST
+            sleep_ms(16);
+#endif
+            continue;
+        }
         ui_clear();
         ui_center(20, "SONIDO", 2, 0xFFFFD040);
         snprintf(line, sizeof line, "VOLUMEN  %d%%", g_volume);
@@ -5781,6 +6078,21 @@ static void ui_opt_netinfo(void)
         if (e & UI_UP)   { g_netinfo = (g_netinfo + 2) % 3; opts_save(); }
         if (e & UI_DOWN) { g_netinfo = (g_netinfo + 1) % 3; opts_save(); }
         if (e & (UI_OK | UI_CANCEL | UI_START)) break;
+        if (hr_usable()) {
+            static const HHint hh[2] = { { "X", "VOLVER", HC_BX }, { "O", "VOLVER", HC_BO } };
+            hr_head("INFO DE RED  ·  en partida online, arriba a la izquierda");
+            hr_panel(70, 210, 900, 570);
+            hr_rows(96, 232, 778, names, 3, g_netinfo, 0, 58);
+            hr_text(96, 446, desc[g_netinfo], FS_M, HC_GREEN, 2);
+            hr_text(96, 496, "DELAY = cuadros de espera (1 cuadro = 17 ms)", FS_S, HC_DIM, 2);
+            hr_text(96, 532, "TRABAS = cuadros lentos en el último segundo", FS_S, HC_DIM, 2);
+            hr_hints(hh, 2);
+            present();
+#ifdef NESNET_HOST
+            sleep_ms(16);
+#endif
+            continue;
+        }
         ui_clear();
         ui_center(20, "INFO DE RED", 2, 0xFFFFD040);
         ui_center(46, "EN PARTIDA ONLINE (ARRIBA A LA IZQUIERDA)", 1, 0xFFC0C0FF);
@@ -5813,6 +6125,16 @@ static void img_clamp(void)
     if (g_img_dy > IMG_SHIFT_MAX) g_img_dy = IMG_SHIFT_MAX;
 }
 
+static int hr_adj_ok(void)
+{
+    int a = g_adjusting, ok, dw, dh, z;
+    g_adjusting = 0;
+    ok = hr_usable();
+    g_adjusting = a;
+    shot_geometry(&dw, &dh, &z);
+    return ok && dw == HR_W && dh == HR_H;
+}
+
 static void ui_opt_image(void)
 {
     int sel = 0, i, x, y;
@@ -5840,6 +6162,7 @@ static void ui_opt_image(void)
             else if (sel == 4) break;
         }
         ui_clear();
+        if (!hr_adj_ok()) {
         ui_center(20, "AJUSTE DE IMAGEN", 2, 0xFFFFD040);
         for (i = 0; i < 5; i++) {
             uint32_t col = i == sel ? 0xFFFFFFFF : 0xFF8080A0;
@@ -5854,6 +6177,7 @@ static void ui_opt_image(void)
         ui_center(180, "(ES EL BORDE DE LA IMAGEN)", 1, 0xFF80FF80);
         if (!g_cfg.render) ui_center(196, "AVISO: EL MODO GPU NO USA ESTO", 1, 0xFFFFC040);
         ui_center(212, "O: VOLVER", 1, 0xFF8080A0);
+        }
         /* marco blanco en el borde del lienzo, con una marca en cada esquina y en el centro de cada lado */
         for (x = 0; x < SCR_W; x++) { g_fb[x] = 0xFFFFFFFF; g_fb[(SCR_H - 1) * SCR_W + x] = 0xFFFFFFFF; }
         for (y = 0; y < SCR_H; y++) { g_fb[y * SCR_W] = 0xFFFFFFFF; g_fb[y * SCR_W + SCR_W - 1] = 0xFFFFFFFF; }
@@ -5862,6 +6186,30 @@ static void ui_opt_image(void)
             g_fb[(SCR_H - 2 - i) * SCR_W + 1] = 0xFFFF4040; g_fb[(SCR_H - 2 - i) * SCR_W + SCR_W - 2] = 0xFFFF4040;
             g_fb[SCR_W + 1 + i] = 0xFFFF4040; g_fb[SCR_W + SCR_W - 2 - i] = 0xFFFF4040;
             g_fb[(SCR_H - 2) * SCR_W + 1 + i] = 0xFFFF4040; g_fb[(SCR_H - 2) * SCR_W + SCR_W - 2 - i] = 0xFFFF4040;
+        }
+        if (hr_adj_ok()) {          /* v1.9.7: el marco (con la geometria real) y encima el cuadro de ajustes a 1280x720 */
+            static const HHint hh[2] = { { "<>", "CAMBIAR", HC_BG }, { "O", "VOLVER", HC_BO } };
+            static unsigned fcn;
+            int dw, dh, z;
+            char v[24];
+            shot_geometry(&dw, &dh, &z);
+            hr_init();
+            memset(g_hr, 0, sizeof g_hr);
+            canvas_blit_adj(g_hr, dw, dh, g_screen, z, g_fb, &fcn, g_img_size, g_img_dx, g_img_dy);
+            hr_panel(300, 150, 980, 590);
+            hr_text(330, 204, "AJUSTE DE IMAGEN", FS_H, HC_YEL, 3);
+            for (i = 0; i < 5; i++) {
+                const char *nm = i == 0 ? "TAMAÑO" : i == 1 ? "HORIZONTAL" : i == 2 ? "VERTICAL" : i == 3 ? "RESTAURAR  (100 %, 0, 0)" : "VOLVER";
+                v[0] = 0;
+                if (i == 0) snprintf(v, sizeof v, "%d %%", g_img_size);
+                else if (i == 1) snprintf(v, sizeof v, "%+d", g_img_dx);
+                else if (i == 2) snprintf(v, sizeof v, "%+d", g_img_dy);
+                hr_row2(320, 226 + i * 46, 640, 46, nm, v[0] ? v : NULL, i == sel, 400);
+            }
+            hr_text(330, 500, "Ajusta hasta ver el marco blanco entero", FS_S, HC_GREEN, 2);
+            hr_text(330, 534, "(es el borde de la imagen)", FS_S, HC_GREEN, 2);
+            hr_hints(hh, 2);
+            g_hr_on = 1;
         }
         present();
 #ifdef NESNET_HOST
@@ -5894,6 +6242,30 @@ static void ui_options(void)
             else if (sel == 3) { ui_opt_netinfo(); ui_prime(); g_stage = "opciones"; }
             else if (sel == 4) { ui_opt_image(); ui_prime(); g_stage = "opciones"; }
             else break;
+        }
+        if (hr_usable()) {
+            static const HHint hh[2] = { { "X", "ENTRAR", HC_BX }, { "O", "VOLVER", HC_BO } };
+            char fps[40], val[24];
+            const char *rows[7];
+            for (i = 0; i < 7; i++) rows[i] = items[i];
+            snprintf(fps, sizeof fps, "FPS EN PANTALLA: %s", g_showfps ? "SÍ" : "NO");
+            rows[5] = fps;
+            hr_head("OPCIONES  ·  se guardan solas");
+            hr_panel(70, 210, 900, 650);
+            hr_rows(96, 232, 778, rows, 7, sel, 0, 58);
+            hr_panel(940, 210, 1210, 430);
+            hr_text(962, 250, "Ahora", FS_M, HC_YEL, 2);
+            hr_text(962, 290, "Pantalla:", FS_S, HC_DIM, 2);
+            hr_text(962, 324, screen_names[g_screen], hr_tw(screen_names[g_screen], FS_M) > 236 ? FS_S : FS_M, HC_WHITE, 2);
+            hr_text(962, 368, "Volumen:", FS_S, HC_DIM, 2);
+            snprintf(val, sizeof val, "%d %%", g_volume);
+            hr_text(962, 402, val, FS_M, HC_WHITE, 2);
+            hr_hints(hh, 2);
+            present();
+#ifdef NESNET_HOST
+            sleep_ms(16);
+#endif
+            continue;
         }
         ui_clear();
         ui_center(20, "OPCIONES", 2, 0xFFFFD040);
@@ -5938,6 +6310,30 @@ static int ui_menu(void)
             if (modes[g_menu_sel] != MODE_ROM && modes[g_menu_sel] != MODE_OPT && !g_rom) ui_message("PRIMERO ELIGE UNA ROM", "OPCION: ELEGIR ROM", 120);
             else return modes[g_menu_sel];
         }
+        if (hr_usable()) {
+            static const HHint hh[2] = { { "X", "ELEGIR", HC_BX }, { "O", "SALIR AL XMB", HC_BO } };
+            unsigned dis = 0;
+            for (i = 0; i < 6; i++) if (!g_rom && modes[i] != MODE_ROM && modes[i] != MODE_OPT) dis |= 1u << i;
+            hr_head("NES CON NETPLAY PARA PS3");
+            hr_panel(70, 210, 790, 652);
+            if (g_rom) {
+                fit_name(nm, sizeof nm, g_rom_name, 34);
+                snprintf(l, sizeof l, "ROM: %s", nm);
+                hr_text(96, 252, l, FS_M, HC_GREEN, 2);
+            } else hr_text(96, 252, "ROM: NINGUNA (ELIGE UNA)", FS_M, HC_AMBER, 2);
+            hr_rows(96, 280, 668, items, 6, g_menu_sel, dis, 58);
+            hr_panel(830, 210, 1210, 440);
+            hr_text(856, 252, "EN PARTIDA", FS_M, HC_YEL, 2);
+            hr_text(856, 302, "R3", FS_M, HC_WHITE, 2);  hr_text(930, 302, "menú", FS_S, HC_DIM, 2);
+            hr_text(856, 352, "L2", FS_M, HC_WHITE, 2);  hr_text(930, 352, "captura de pantalla", FS_S, HC_DIM, 2);
+            hr_text(856, 402, "O", FS_M, HC_WHITE, 2);   hr_text(930, 402, "salir al XMB (aquí)", FS_S, HC_DIM, 2);
+            hr_hints(hh, 2);
+            present();
+#ifdef NESNET_HOST
+            sleep_ms(16);
+#endif
+            continue;
+        }
         ui_clear();
         ui_center(20, "NESNET V1.9.7", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
@@ -5981,6 +6377,21 @@ static int ui_menu4(void)
         if (e & UI_DOWN) sel = (sel + 1) % 3;
         if (e & UI_CANCEL) return -1;
         if (e & (UI_OK | UI_START)) return sel == 0 ? MODE_HOST : sel == 1 ? MODE_JOIN : -1;
+        if (hr_usable()) {
+            static const HHint hh[2] = { { "X", "ELEGIR", HC_BX }, { "O", "VOLVER", HC_BO } };
+            hr_head("MULTIJUGADOR DE 4  ·  Four Score");
+            hr_panel(70, 210, 790, 570);
+            hr_text(96, 252, "HOST: mandos 1 y 2", FS_M, HC_GREEN, 2);
+            hr_text(96, 290, "EL QUE SE UNE: mandos 3 y 4", FS_M, HC_GREEN, 2);
+            hr_rows(96, 316, 668, items, 3, sel, 0, 58);
+            hr_text(96, 540, "Solo juegos con Four Score", FS_S, HC_DIM, 2);
+            hr_hints(hh, 2);
+            present();
+#ifdef NESNET_HOST
+            sleep_ms(16);
+#endif
+            continue;
+        }
         ui_clear();
         ui_center(20, "NESNET V1.9.7", 2, 0xFFFFD040);
         ui_center(46, "MULTIJUGADOR DE 4 (FOUR SCORE)", 1, 0xFFC0C0FF);
@@ -6032,6 +6443,29 @@ static int ui_enter_code(char *out)
                 }
             }
             return 1;
+        }
+        if (hr_usable()) {
+            static const HHint hh[2] = { { "START", "CONECTAR", HC_BX }, { "O", "CANCELAR", HC_BO } };
+            int adv = hr_tw("0", FS_X), tot = 10 * adv + 2 * 36, x0 = (HR_W - tot) / 2, k;
+            hr_head("UNIRSE A UNA SALA");
+            hr_panel(230, 200, 1050, 600);
+            hr_text(270, 252, "ESCRIBE EL CÓDIGO DEL HOST", FS_M, HC_DIM, 2);
+            for (k = 0; k < 10; k++) {
+                char c1[2] = { (char)('0' + d[k]), 0 };
+                int x = x0 + k * adv + (k >= 3 ? 36 : 0) + (k >= 6 ? 36 : 0);
+                hr_text(x, 372, c1, FS_X, k == pos ? HC_YEL : HC_WHITE, 4);
+                if (k == pos) hr_rect(x + 4, 392, x + adv - 8, 402, HC_YEL, 256);
+            }
+            snprintf(line, sizeof line, "Dígito %d de 10", pos + 1);
+            hr_text(270, 460, line, FS_S, HC_DIM, 2);
+            if (saved) hr_text(270, 500, "Último código usado: START para conectar", FS_S, HC_GREEN, 2);
+            hr_text(270, 548, "ARRIBA/ABAJO cambia el dígito  ·  IZQ/DER mueve", FS_S, HC_DIM, 2);
+            hr_hints(hh, 2);
+            present();
+#ifdef NESNET_HOST
+            sleep_ms(16);
+#endif
+            continue;
         }
         ui_clear();
         ui_center(20, "NESNET V1.9.7", 2, 0xFFFFD040);
@@ -6135,6 +6569,10 @@ static int run_host_inner(void)
         if (!g_running) { closesocket(lfd); return 1; }
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
+        if (hr_usable()) {
+            hr_room_screen("CREAR SALA (HOST)", code, l2, l3, col3);
+            present();
+        } else {
         ui_clear();
         ui_center(20, "NESNET V1.9.7", 2, 0xFFFFD040);
         ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
@@ -6145,6 +6583,7 @@ static int run_host_inner(void)
         ui_center(176, "ESPERANDO AL AMIGO...", 1, 0xFFFFFFFF);
         ui_center(200, "O: CANCELAR", 1, 0xFF8080A0);
         present();
+        }
         {
             int r = fd_wait(lfd, POLLIN, 0);
             if (r > 0) {
@@ -6281,6 +6720,10 @@ static int run_host4_inner(void)
         if (!g_running) { closesocket(lfd); return 1; }
         e = ui_edges();
         if (e & UI_CANCEL) { closesocket(lfd); g_err = ""; return 1; }
+        if (hr_usable()) {
+            hr_room_screen("SALA DE 4 (HOST)", code, l2, l3, col3);
+            present();
+        } else {
         ui_clear();
         ui_center(20, "NESNET V1.9.7", 2, 0xFFFFD040);
         ui_center(64, "SALA DE 4 - TU CODIGO:", 1, 0xFFFFFFFF);
@@ -6291,6 +6734,7 @@ static int run_host4_inner(void)
         ui_center(176, "ESPERANDO AL AMIGO...", 1, 0xFFFFFFFF);
         ui_center(200, "O: CANCELAR", 1, 0xFF8080A0);
         present();
+        }
         {
             int r = fd_wait(lfd, POLLIN, 0);
             if (r > 0) {
@@ -6536,6 +6980,7 @@ int main(int argc, char **argv)
         {
             char code[20];
             code_encode(((uint32_t)181 << 24) | (45u << 16) | (200u << 8) | 17u, 7777, code);
+            if (hr_usable()) hr_room_screen("SALA DE 4 (HOST)", code, "puerto 7777", "UPNP: PUERTO ABIERTO", 0xFF80FF80u); else {
             ui_clear();
             ui_center(20, "NESNET V1.9.7", 2, 0xFFFFD040);
             ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
@@ -6544,6 +6989,7 @@ int main(int argc, char **argv)
             ui_center(136, "PUERTO 7777", 1, 0xFFC0C0FF);
             ui_center(170, "ESPERANDO AL AMIGO...", 1, 0xFFFFFFFF);
             ui_center(200, "O: CANCELAR", 1, 0xFF8080A0);
+            }
             snprintf(p, sizeof p, "%s/host.ppm", argv[2]); dump_ppm(p);
         }
         return 0;
