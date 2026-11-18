@@ -2268,7 +2268,7 @@ static void hr_head(const char *sub)
     hr_rect(70, 52, 82, 144, HC_RED, 256);
     x += hr_text(x, base, "NES", FS_X, HC_WHITE, 4);
     x += hr_text(x, base, "NET", FS_X, HC_RED, 4);
-    hr_text(x + 16, base + 4, "v1.9.8", FS_S, HC_DIM, 2);
+    hr_text(x + 16, base + 4, "v1.9.9", FS_S, HC_DIM, 2);
     if (sub) hr_text(98, 172, sub, FS_M, HC_DIM, 2);
 }
 
@@ -2311,27 +2311,6 @@ static void hr_row2(int x, int y, int w, int rh, const char *nm, const char *val
 /* Fondo del menu R3 en partida: la imagen del juego (16:9) oscurecida + un cuadro al centro */
 static uint32_t g_bd[HR_W * HR_H];         /* fondo del menu R3 (juego oscurecido + cuadro), se arma una vez por apertura */
 static int      g_bd_dirty;
-static void hr_backdrop(const uint32_t *fb)
-{
-    int x, y;
-    hr_init();
-    if (g_bd_dirty) {
-        for (y = 0; y < HR_H; y++) {
-            const uint32_t *src = fb + (y / 3) * SCR_W;
-            for (x = 0; x < HR_W; x++) {
-                uint32_t c = src[x / 5];
-                uint32_t v = ((((c >> 16) & 255) + ((c >> 8) & 255) + (c & 255)) / 3) >> 2;     /* gris al 25 % */
-                g_hr[y * HR_W + x] = 0xFF000000u | (v << 16) | (v << 8) | v | 0x00020410u;
-            }
-        }
-        hr_panel(290, 120, 990, 610);
-        memcpy(g_bd, g_hr, sizeof g_hr);
-        g_bd_dirty = 0;
-    }
-    memcpy(g_hr, g_bd, sizeof g_hr);
-    g_hr_on = 1;
-}
-
 static void ui_text(int x, int y, const char *s, int sc, uint32_t col)
 {
     if (g_hr_on) { hr_ui_text(x * 5, y, s, sc, col, 0); return; }
@@ -2777,6 +2756,46 @@ static int screen_out_w(int mode, int dw, int oh, int z)
     return w;
 }
 
+/* v1.9.9: lo que queda fuera de la imagen (barras de ORIGINAL y 4:3) se rellena con el fondo mosaico de NesNet en vez de negro.
+ * Solo si g_bars_mosaic = 1 (lo pone la PS3 con salida de 1280x720); en las pruebas queda en negro como siempre. */
+static int g_bars_mosaic;
+static void bars_fill(uint32_t *base, int dw, int x0, int y0, int x1, int y1)     /* rectangulo [x0,x1) x [y0,y1) */
+{
+    int y;
+    if (x1 <= x0 || y1 <= y0) return;
+    if (g_bars_mosaic && dw == HR_W && x0 >= 0 && x1 <= HR_W && y0 >= 0 && y1 <= HR_H) {
+        for (y = y0; y < y1; y++) memcpy(base + (size_t)y * dw + x0, g_bg + (size_t)y * HR_W + x0, (size_t)(x1 - x0) * 4);
+    } else {
+        for (y = y0; y < y1; y++) memset(base + (size_t)y * dw + x0, 0, (size_t)(x1 - x0) * 4);
+    }
+}
+
+/* Fondo del menu R3 en partida: la imagen del juego oscurecida con la proporcion de la pantalla elegida (ORIGINAL / 4:3 / 16:9,
+ * sin estirarla) y el mosaico a los lados, mas un cuadro al centro. v1.9.9: antes siempre se estiraba a 16:9. */
+static void hr_backdrop(const uint32_t *fb)
+{
+    int x, y, ow, ox;
+    hr_init();
+    if (g_bd_dirty) {
+        ow = screen_out_w(g_screen, HR_W, HR_H, 3);
+        ox = (HR_W - ow) / 2;
+        memcpy(g_hr, g_bg, sizeof g_hr);
+        for (y = 0; y < HR_H; y++) {
+            const uint32_t *src = fb + (y / 3) * SCR_W;
+            for (x = 0; x < ow; x++) {
+                uint32_t c = src[x * SCR_W / ow];
+                uint32_t v = ((((c >> 16) & 255) + ((c >> 8) & 255) + (c & 255)) / 3) >> 2;     /* gris al 25 % */
+                g_hr[y * HR_W + ox + x] = 0xFF000000u | (v << 16) | (v << 8) | v | 0x00020410u;
+            }
+        }
+        hr_panel(290, 120, 990, 610);
+        memcpy(g_bd, g_hr, sizeof g_hr);
+        g_bd_dirty = 0;
+    }
+    memcpy(g_hr, g_bd, sizeof g_hr);
+    g_hr_on = 1;
+}
+
 /* Dibuja el lienzo 256x240 en el buffer de pantalla 'base' (dw x dh, ARGB) centrado, escalado segun 'mode' (vertical entero z).
  * Cada 4 cuadros, DE CADA BUFFER, borra lo que queda fuera de la imagen (residuo del XMB / modo anterior); la imagen se repinta siempre.
  * fcnt = contador de cuadros de ese buffer. Version unica para la PS3 y para las pruebas de PC. */
@@ -2792,14 +2811,12 @@ static void canvas_blit_cpu(uint32_t *base, int dw, int dh, int mode, int z, con
     if (ow != l_ow) { for (x = 0; x < ow; x++) cm[x] = x * SCR_W / ow; l_ow = ow; }
     if (((*fcnt)++ & 3) == 0) {
         int below = dh - oy - oh;
-        if (oy > 0) memset(base, 0, (size_t)oy * dw * 4);
-        if (below > 0) memset(base + (size_t)(oy + oh) * dw, 0, (size_t)below * dw * 4);
+        if (oy > 0) bars_fill(base, dw, 0, 0, dw, oy);
+        if (below > 0) bars_fill(base, dw, 0, oy + oh, dw, dh);
         if (ox > 0) {
             int right = dw - ox - ow;
-            for (y = oy; y < oy + oh; y++) {
-                memset(base + (size_t)y * dw, 0, (size_t)ox * 4);
-                if (right > 0) memset(base + (size_t)y * dw + ox + ow, 0, (size_t)right * 4);
-            }
+            bars_fill(base, dw, 0, oy, ox, oy + oh);
+            if (right > 0) bars_fill(base, dw, ox + ow, oy, dw, oy + oh);
         }
     }
     dst = base + (size_t)oy * dw + ox;
@@ -2833,8 +2850,8 @@ static void canvas_blit_adj(uint32_t *base, int dw, int dh, int mode, int z, con
     ox = (dw - ow) / 2 + dx; oy = (dh - oh) / 2 + dy;
     if (ow != l_ow) { for (x = 0; x < ow; x++) cm[x] = x * SCR_W / ow; l_ow = ow; }
     if (ox != geo[0] || oy != geo[1] || ow != geo[2] || oh != geo[3]) { geo[0] = ox; geo[1] = oy; geo[2] = ow; geo[3] = oh; force_clear = 2; }
-    if (force_clear > 0) { force_clear--; (*fcnt)++; memset(base, 0, (size_t)dw * dh * 4); }
-    else if (((*fcnt)++ & 3) == 0) memset(base, 0, (size_t)dw * dh * 4);
+    if (force_clear > 0) { force_clear--; (*fcnt)++; bars_fill(base, dw, 0, 0, dw, dh); }
+    else if (((*fcnt)++ & 3) == 0) bars_fill(base, dw, 0, 0, dw, dh);
     x0 = ox < 0 ? 0 : ox;  x1 = ox + ow > dw ? dw : ox + ow;
     y0 = oy < 0 ? 0 : oy;  y1 = oy + oh > dh ? dh : oy + oh;
     if (x1 <= x0 || y1 <= y0) return;
@@ -3142,11 +3159,14 @@ static void gpu_blit_canvas(void)
         /* v1.3: cada 4 cuadros DE CADA BUFFER se limpia lo que queda fuera del juego (bordes) para que no se quede el
          * residuo del XMB (reloj / bateria del mando); el juego mismo se repinta siempre.
          * v1.8.2: el escalado (modo de pantalla elegido en OPCIONES) y esa limpieza viven en canvas_blit_cpu. */
+        g_bars_mosaic = (g_dw == HR_W && g_dh == HR_H);      /* v1.9.9: barras con el mosaico (solo en 1280x720) */
+        if (g_bars_mosaic) hr_init();
         if (g_img_size == 100 && g_img_dx == 0 && g_img_dy == 0)
             canvas_blit_cpu((uint32_t *)g_cbuf[g_cur], (int)g_dw, (int)g_dh, smode, g_zoom, (const uint32_t *)g_fb, &cpu_frame[g_cur & 1]);
         else   /* v1.9.2: con el ajuste de imagen tocado */
             canvas_blit_adj((uint32_t *)g_cbuf[g_cur], (int)g_dw, (int)g_dh, smode, g_zoom, (const uint32_t *)g_fb, &cpu_frame[g_cur & 1],
                             g_img_size, g_img_dx, g_img_dy);
+        g_bars_mosaic = 0;
         return;
     }
 
@@ -5668,7 +5688,7 @@ static void ui_show(const char *l1, const char *l2, const char *l3)
         return;
     }
     ui_clear();
-    ui_center(20, "NESNET V1.9.8", 2, 0xFFFFD040);
+    ui_center(20, "NESNET V1.9.9", 2, 0xFFFFD040);
     if (l1) ui_center(90, l1, 1, 0xFFFFFFFF);
     if (l2) ui_center(110, l2, 1, 0xFFC0C0FF);
     if (l3) ui_center(130, l3, 1, 0xFFC0C0FF);
@@ -6742,8 +6762,10 @@ static void ui_opt_image(void)
             char v[24];
             shot_geometry(&dw, &dh, &z);
             hr_init();
-            memset(g_hr, 0, sizeof g_hr);
+            memcpy(g_hr, g_bg, sizeof g_hr);                 /* v1.9.9: las barras con el mosaico, no negras */
+            g_bars_mosaic = (dw == HR_W && dh == HR_H);
             canvas_blit_adj(g_hr, dw, dh, g_screen, z, g_fb, &fcn, g_img_size, g_img_dx, g_img_dy);
+            g_bars_mosaic = 0;
             hr_panel(300, 150, 980, 590);
             hr_text(330, 204, "AJUSTE DE IMAGEN", FS_H, HC_YEL, 3);
             for (i = 0; i < 5; i++) {
@@ -6883,7 +6905,7 @@ static int ui_menu(void)
             continue;
         }
         ui_clear();
-        ui_center(20, "NESNET V1.9.8", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.9", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         if (g_rom) {
             fit_name(nm, sizeof nm, g_rom_name, 34);
@@ -6941,7 +6963,7 @@ static int ui_menu4(void)
             continue;
         }
         ui_clear();
-        ui_center(20, "NESNET V1.9.8", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.9", 2, 0xFFFFD040);
         ui_center(46, "MULTIJUGADOR DE 4 (FOUR SCORE)", 1, 0xFFC0C0FF);
         ui_center(66, "HOST: MANDOS 1 Y 2", 1, 0xFF80FF80);
         ui_center(80, "EL QUE SE UNE: MANDOS 3 Y 4", 1, 0xFF80FF80);
@@ -7016,7 +7038,7 @@ static int ui_enter_code(char *out)
             continue;
         }
         ui_clear();
-        ui_center(20, "NESNET V1.9.8", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.9", 2, 0xFFFFD040);
         ui_center(60, "ESCRIBE EL CODIGO DEL HOST", 1, 0xFFFFFFFF);
         for (i = 0; i < 10; i++) {
             char c[2] = { (char)('0' + d[i]), 0 };
@@ -7122,7 +7144,7 @@ static int run_host_inner(void)
             present();
         } else {
         ui_clear();
-        ui_center(20, "NESNET V1.9.8", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.9", 2, 0xFFFFD040);
         ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
         { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -7273,7 +7295,7 @@ static int run_host4_inner(void)
             present();
         } else {
         ui_clear();
-        ui_center(20, "NESNET V1.9.8", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.9", 2, 0xFFFFD040);
         ui_center(64, "SALA DE 4 - TU CODIGO:", 1, 0xFFFFFFFF);
         { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -7379,7 +7401,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("NesNet v1.9.8 (caratulas en ELEGIR ROM (USRDIR/covers, .png); menus en 1280x720 con fuente DejaVu Bold y fondo mosaico; L2 = captura de pantalla limpia en PNG; menu en partida con R3; 6 ranuras de estado; guardar/cargar estado online (host); O sale al XMB; menus siempre a pantalla completa; codigo de sala guardado al unirse) - dir=%s", g_dir);
+    logf_("NesNet v1.9.9 (barras con mosaico, fondo del menu R3 sin estirar; caratulas en ELEGIR ROM (USRDIR/covers, .png); menus en 1280x720 con fuente DejaVu Bold y fondo mosaico; L2 = captura de pantalla limpia en PNG; menu en partida con R3; 6 ranuras de estado; guardar/cargar estado online (host); O sale al XMB; menus siempre a pantalla completa; codigo de sala guardado al unirse) - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
@@ -7517,7 +7539,7 @@ int main(int argc, char **argv)
         static const char *items[3] = { "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS" };
         int i;
         ui_clear();
-        ui_center(20, "NESNET V1.9.8", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.9", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         for (i = 0; i < 3; i++) {
             char line[40];
@@ -7530,7 +7552,7 @@ int main(int argc, char **argv)
             code_encode(((uint32_t)181 << 24) | (45u << 16) | (200u << 8) | 17u, 7777, code);
             if (hr_usable()) hr_room_screen("SALA DE 4 (HOST)", code, "puerto 7777", "UPNP: PUERTO ABIERTO", 0xFF80FF80u); else {
             ui_clear();
-            ui_center(20, "NESNET V1.9.8", 2, 0xFFFFD040);
+            ui_center(20, "NESNET V1.9.9", 2, 0xFFFFD040);
             ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
             { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
             ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -7765,6 +7787,38 @@ int main(int argc, char **argv)
             bad += sb;
         }
         printf("maptest TOTAL bad=%u\n", bad);
+        return bad != 0;
+    } else if (!strcmp(mode, "barstest")) {
+        /* v1.9.9: barras con mosaico y fondo del menu R3 segun la pantalla (argv[4] = carpeta de salida) */
+        static uint32_t fbuf[SCR_W * SCR_H], buf[HR_W * HR_H];
+        const char *od = argc > 4 ? argv[4] : "/tmp";
+        int md, x, y, bad = 0;
+        for (y = 0; y < SCR_H; y++) for (x = 0; x < SCR_W; x++) fbuf[y * SCR_W + x] = 0xFF000000u | ((uint32_t)(x * 255 / 255) << 16) | ((uint32_t)(y * 255 / 239) << 8) | 0x60u;
+        for (x = 0; x < SCR_W; x++) { fbuf[x] = 0xFFFFFFFFu; fbuf[(SCR_H - 1) * SCR_W + x] = 0xFFFFFFFFu; }
+        for (y = 0; y < SCR_H; y++) { fbuf[y * SCR_W] = 0xFFFFFFFFu; fbuf[y * SCR_W + SCR_W - 1] = 0xFFFFFFFFu; }
+        hr_init();
+        for (md = 0; md < 3; md++) {
+            unsigned fc = 0;
+            char p[400];
+            FILE *f;
+            int i, ox, ow = screen_out_w(md, HR_W, SCR_H * 3, 3);
+            ox = (HR_W - ow) / 2;
+            for (i = 0; i < HR_W * HR_H; i++) buf[i] = 0xFF804020u;       /* "residuo" que debe desaparecer */
+            g_bars_mosaic = 1;
+            canvas_blit_cpu(buf, HR_W, HR_H, md, 3, fbuf, &fc);
+            g_bars_mosaic = 0;
+            for (y = 0; y < HR_H; y++) for (x = 0; x < ox; x++)
+                if (buf[y * HR_W + x] != g_bg[y * HR_W + x] || buf[y * HR_W + HR_W - 1 - x] != g_bg[y * HR_W + HR_W - 1 - x]) bad++;
+            snprintf(p, sizeof p, "%s/game_%d.ppm", od, md);
+            f = fopen(p, "wb");
+            if (f) { fprintf(f, "P6\n%d %d\n255\n", HR_W, HR_H); for (i = 0; i < HR_W * HR_H; i++) { uint8_t px[3] = { (uint8_t)(buf[i] >> 16), (uint8_t)(buf[i] >> 8), (uint8_t)buf[i] }; fwrite(px, 1, 3, f); } fclose(f); }
+            g_screen = md; g_bd_dirty = 1;
+            hr_backdrop(fbuf);
+            snprintf(p, sizeof p, "%s/menu_%d.ppm", od, md);
+            f = fopen(p, "wb");
+            if (f) { fprintf(f, "P6\n%d %d\n255\n", HR_W, HR_H); for (i = 0; i < HR_W * HR_H; i++) { uint8_t px[3] = { (uint8_t)(g_hr[i] >> 16), (uint8_t)(g_hr[i] >> 8), (uint8_t)g_hr[i] }; fwrite(px, 1, 3, f); } fclose(f); }
+        }
+        printf("barstest bad=%d\n", bad);
         return bad != 0;
     } else if (!strcmp(mode, "imgtest")) {
         /* v1.9.2: ajuste de imagen (canvas_blit_adj) y guardado de las opciones nuevas */
