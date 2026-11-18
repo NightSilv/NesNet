@@ -2268,7 +2268,7 @@ static void hr_head(const char *sub)
     hr_rect(70, 52, 82, 144, HC_RED, 256);
     x += hr_text(x, base, "NES", FS_X, HC_WHITE, 4);
     x += hr_text(x, base, "NET", FS_X, HC_RED, 4);
-    hr_text(x + 16, base + 4, "v1.9.7", FS_S, HC_DIM, 2);
+    hr_text(x + 16, base + 4, "v1.9.8", FS_S, HC_DIM, 2);
     if (sub) hr_text(98, 172, sub, FS_M, HC_DIM, 2);
 }
 
@@ -5668,7 +5668,7 @@ static void ui_show(const char *l1, const char *l2, const char *l3)
         return;
     }
     ui_clear();
-    ui_center(20, "NESNET V1.9.7", 2, 0xFFFFD040);
+    ui_center(20, "NESNET V1.9.8", 2, 0xFFFFD040);
     if (l1) ui_center(90, l1, 1, 0xFFFFFFFF);
     if (l2) ui_center(110, l2, 1, 0xFFC0C0FF);
     if (l3) ui_center(130, l3, 1, 0xFFC0C0FF);
@@ -5701,6 +5701,548 @@ static void fit_name(char *dst, size_t cap, const char *src, int maxc)
     if (maxc >= 3) { dst[maxc - 3] = '.'; dst[maxc - 2] = '.'; dst[maxc - 1] = '.'; }
 }
 
+/* ------------------------------------------------------------------ */
+/* v1.9.8: caratulas. Lector de PNG propio (inflate + filtros), sin librerias externas.                 */
+/* Soporta PNG de 1/2/4/8/16 bits, gris, RGB, paleta, gris+alfa y RGBA, con o sin entrelazado (Adam7). */
+/* ------------------------------------------------------------------ */
+#define CV_MAXDIM    1024            /* lado maximo aceptado (px) */
+#define CV_MAXFILE   (3u << 20)      /* archivo maximo: 3 MB */
+#define CV_MAXRAW    (9u << 20)      /* datos descomprimidos maximos: 9 MB */
+
+#define CI_MAXBITS 15
+#define CI_MAXL    286
+#define CI_MAXD    30
+#define CI_FIXL    288
+
+typedef struct {
+    const uint8_t *in; size_t inlen, incnt;
+    uint32_t bitbuf; int bitcnt;
+    uint8_t *out; size_t outlen, outcnt;
+} CInf;
+
+typedef struct { short *count; short *symbol; } CHuff;
+
+static int ci_bits(CInf *s, int need)
+{
+    uint32_t val = s->bitbuf;
+    while (s->bitcnt < need) {
+        if (s->incnt >= s->inlen) return -1;
+        val |= (uint32_t)s->in[s->incnt++] << s->bitcnt;
+        s->bitcnt += 8;
+    }
+    s->bitbuf = val >> need;
+    s->bitcnt -= need;
+    return (int)(val & ((1u << need) - 1u));
+}
+
+static int ci_decode(CInf *s, const CHuff *h)
+{
+    int len, code = 0, first = 0, count, index = 0;
+    for (len = 1; len <= CI_MAXBITS; len++) {
+        int b = ci_bits(s, 1);
+        if (b < 0) return -1;
+        code |= b;
+        count = h->count[len];
+        if (code - count < first) return h->symbol[index + (code - first)];
+        index += count; first += count; first <<= 1; code <<= 1;
+    }
+    return -10;
+}
+
+static int ci_construct(CHuff *h, const short *length, int n)
+{
+    int symbol, len, left;
+    short offs[CI_MAXBITS + 1];
+    for (len = 0; len <= CI_MAXBITS; len++) h->count[len] = 0;
+    for (symbol = 0; symbol < n; symbol++) h->count[length[symbol]]++;
+    if (h->count[0] == n) return 0;
+    left = 1;
+    for (len = 1; len <= CI_MAXBITS; len++) {
+        left <<= 1;
+        left -= h->count[len];
+        if (left < 0) return left;
+    }
+    offs[1] = 0;
+    for (len = 1; len < CI_MAXBITS; len++) offs[len + 1] = (short)(offs[len] + h->count[len]);
+    for (symbol = 0; symbol < n; symbol++)
+        if (length[symbol] != 0) h->symbol[offs[length[symbol]]++] = (short)symbol;
+    return left;
+}
+
+static int ci_codes(CInf *s, const CHuff *lencode, const CHuff *distcode)
+{
+    static const short lens[29] = { 3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258 };
+    static const short lext[29] = { 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0 };
+    static const short dists[30] = { 1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577 };
+    static const short dext[30] = { 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13 };
+    int symbol;
+    do {
+        symbol = ci_decode(s, lencode);
+        if (symbol < 0) return symbol;
+        if (symbol < 256) {
+            if (s->outcnt == s->outlen) return 1;
+            s->out[s->outcnt++] = (uint8_t)symbol;
+        } else if (symbol > 256) {
+            int len, b;
+            size_t dist;
+            symbol -= 257;
+            if (symbol >= 29) return -10;
+            b = ci_bits(s, lext[symbol]);
+            if (b < 0) return -1;
+            len = lens[symbol] + b;
+            symbol = ci_decode(s, distcode);
+            if (symbol < 0) return symbol;
+            if (symbol >= 30) return -10;
+            b = ci_bits(s, dext[symbol]);
+            if (b < 0) return -1;
+            dist = (size_t)dists[symbol] + (size_t)b;
+            if (dist > s->outcnt) return -11;
+            if (s->outcnt + (size_t)len > s->outlen) return 1;
+            while (len--) { s->out[s->outcnt] = s->out[s->outcnt - dist]; s->outcnt++; }
+        }
+    } while (symbol != 256);
+    return 0;
+}
+
+static int ci_stored(CInf *s)
+{
+    unsigned len;
+    s->bitbuf = 0; s->bitcnt = 0;
+    if (s->incnt + 4 > s->inlen) return 2;
+    len = s->in[s->incnt++]; len |= (unsigned)s->in[s->incnt++] << 8;
+    if (s->in[s->incnt++] != (~len & 0xFFu) || s->in[s->incnt++] != ((~len >> 8) & 0xFFu)) return -2;
+    if (s->incnt + len > s->inlen) return 2;
+    if (s->outcnt + len > s->outlen) return 1;
+    while (len--) s->out[s->outcnt++] = s->in[s->incnt++];
+    return 0;
+}
+
+static int ci_fixed(CInf *s)
+{
+    static int virgin = 1;
+    static short lc[CI_MAXBITS + 1], ls[CI_FIXL], dc[CI_MAXBITS + 1], ds[CI_MAXD];
+    static CHuff lencode, distcode;
+    if (virgin) {
+        short lengths[CI_FIXL];
+        int sym;
+        lencode.count = lc; lencode.symbol = ls; distcode.count = dc; distcode.symbol = ds;
+        for (sym = 0; sym < 144; sym++) lengths[sym] = 8;
+        for (; sym < 256; sym++) lengths[sym] = 9;
+        for (; sym < 280; sym++) lengths[sym] = 7;
+        for (; sym < CI_FIXL; sym++) lengths[sym] = 8;
+        ci_construct(&lencode, lengths, CI_FIXL);
+        for (sym = 0; sym < CI_MAXD; sym++) lengths[sym] = 5;
+        ci_construct(&distcode, lengths, CI_MAXD);
+        virgin = 0;
+    }
+    return ci_codes(s, &lencode, &distcode);
+}
+
+static int ci_dynamic(CInf *s)
+{
+    static const short order[19] = { 16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15 };
+    int nlen, ndist, ncode, index, err, b;
+    short lengths[CI_MAXL + CI_MAXD];
+    short lc[CI_MAXBITS + 1], ls[CI_MAXL], dc[CI_MAXBITS + 1], ds[CI_MAXD];
+    CHuff lencode, distcode;
+    b = ci_bits(s, 5); if (b < 0) return -1; nlen = b + 257;
+    b = ci_bits(s, 5); if (b < 0) return -1; ndist = b + 1;
+    b = ci_bits(s, 4); if (b < 0) return -1; ncode = b + 4;
+    if (nlen > CI_MAXL || ndist > CI_MAXD) return -3;
+    for (index = 0; index < ncode; index++) { b = ci_bits(s, 3); if (b < 0) return -1; lengths[order[index]] = (short)b; }
+    for (; index < 19; index++) lengths[order[index]] = 0;
+    lencode.count = lc; lencode.symbol = ls;
+    err = ci_construct(&lencode, lengths, 19);
+    if (err != 0) return -4;
+    index = 0;
+    while (index < nlen + ndist) {
+        int symbol = ci_decode(s, &lencode);
+        if (symbol < 0) return symbol;
+        if (symbol < 16) lengths[index++] = (short)symbol;
+        else {
+            int len = 0, rep;
+            if (symbol == 16) {
+                if (index == 0) return -5;
+                len = lengths[index - 1];
+                b = ci_bits(s, 2); if (b < 0) return -1; rep = 3 + b;
+            } else if (symbol == 17) { b = ci_bits(s, 3); if (b < 0) return -1; rep = 3 + b; }
+            else { b = ci_bits(s, 7); if (b < 0) return -1; rep = 11 + b; }
+            if (index + rep > nlen + ndist) return -6;
+            while (rep--) lengths[index++] = (short)len;
+        }
+    }
+    if (lengths[256] == 0) return -9;
+    err = ci_construct(&lencode, lengths, nlen);
+    if (err && (err < 0 || nlen != lencode.count[0] + lencode.count[1])) return -7;
+    distcode.count = dc; distcode.symbol = ds;
+    err = ci_construct(&distcode, lengths + nlen, ndist);
+    if (err && (err < 0 || ndist != distcode.count[0] + distcode.count[1])) return -8;
+    return ci_codes(s, &lencode, &distcode);
+}
+
+/* inflate de un flujo "raw deflate"; 0 = bien (la salida tiene que llenarse exacta) */
+static int ci_inflate(const uint8_t *in, size_t inlen, uint8_t *out, size_t outlen)
+{
+    CInf s;
+    int last, type, err = 0;
+    s.in = in; s.inlen = inlen; s.incnt = 0; s.bitbuf = 0; s.bitcnt = 0;
+    s.out = out; s.outlen = outlen; s.outcnt = 0;
+    do {
+        last = ci_bits(&s, 1);
+        type = ci_bits(&s, 2);
+        if (last < 0 || type < 0) { err = -1; break; }
+        err = type == 0 ? ci_stored(&s) : type == 1 ? ci_fixed(&s) : type == 2 ? ci_dynamic(&s) : -1;
+        if (err) break;
+    } while (!last);
+    if (s.outcnt == outlen) return 0;      /* si ya se lleno lo esperado, vale (aunque sobre flujo) */
+    return err ? err : -12;
+}
+
+static uint32_t cv_be32(const uint8_t *p) { return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3]; }
+
+/* quita los filtros PNG de "rows" filas de (1 + rb) bytes, en el mismo lugar */
+static int cv_unfilter(uint8_t *buf, int rb, int rows, int bpb)
+{
+    int r, i;
+    for (r = 0; r < rows; r++) {
+        uint8_t *row = buf + (size_t)r * (size_t)(rb + 1);
+        uint8_t ft = row[0];
+        uint8_t *x = row + 1;
+        const uint8_t *up = r ? row - (rb + 1) + 1 : NULL;
+        if (ft > 4) return -1;
+        for (i = 0; i < rb; i++) {
+            int a = i >= bpb ? x[i - bpb] : 0;
+            int b = up ? up[i] : 0;
+            int c = (up && i >= bpb) ? up[i - bpb] : 0;
+            int v = x[i];
+            switch (ft) {
+            case 1: v += a; break;
+            case 2: v += b; break;
+            case 3: v += (a + b) / 2; break;
+            case 4: {
+                int p = a + b - c, pa = p > a ? p - a : a - p, pb = p > b ? p - b : b - p, pc = p > c ? p - c : c - p;
+                v += (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c);
+                break;
+            }
+            default: break;
+            }
+            x[i] = (uint8_t)v;
+        }
+    }
+    return 0;
+}
+
+typedef struct { int ct, depth, bpp, npal; uint8_t pal[256][4]; } CvFmt;
+
+static uint32_t cv_pixel(const uint8_t *row, int x, const CvFmt *f, uint32_t bg)
+{
+    int r, g, b, a = 255, d = f->depth;
+    switch (f->ct) {
+    case 0: case 3: {
+        int v, bit = x * d;
+        if (d == 16) v = row[x * 2];
+        else if (d == 8) v = row[x];
+        else v = (row[bit >> 3] >> (8 - d - (bit & 7))) & ((1 << d) - 1);
+        if (f->ct == 3) {
+            if (v >= f->npal) v = 0;
+            r = f->pal[v][0]; g = f->pal[v][1]; b = f->pal[v][2]; a = f->pal[v][3];
+        } else {
+            if (d < 8) v = v * 255 / ((1 << d) - 1);
+            r = g = b = v;
+        }
+        break;
+    }
+    case 4: {
+        int st = d == 16 ? 4 : 2;
+        r = g = b = row[x * st];
+        a = row[x * st + (d == 16 ? 2 : 1)];
+        break;
+    }
+    case 2: {
+        int st = d == 16 ? 6 : 3, o = d == 16 ? 2 : 1;
+        r = row[x * st]; g = row[x * st + o]; b = row[x * st + 2 * o];
+        break;
+    }
+    default: {   /* 6 */
+        int st = d == 16 ? 8 : 4, o = d == 16 ? 2 : 1;
+        r = row[x * st]; g = row[x * st + o]; b = row[x * st + 2 * o]; a = row[x * st + 3 * o];
+        break;
+    }
+    }
+    if (a < 255) {
+        int br = (int)((bg >> 16) & 255), bgc = (int)((bg >> 8) & 255), bb = (int)(bg & 255);
+        r = (r * a + br * (255 - a)) / 255; g = (g * a + bgc * (255 - a)) / 255; b = (b * a + bb * (255 - a)) / 255;
+    }
+    return 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
+/* Decodifica un PNG en memoria. Devuelve 0 = bien (*px = malloc de w*h ARGB opacos sobre "bg"; hay que liberarlo con free).
+ * 1 = no es PNG, 2 = demasiado grande, 3 = formato no soportado, 4 = archivo danado, 5 = sin memoria */
+static int cv_png_decode(const uint8_t *f, size_t fn, uint32_t bg, uint32_t **px, int *ow, int *oh)
+{
+    static const int XO[7] = { 0, 4, 0, 2, 0, 1, 0 }, YO[7] = { 0, 0, 4, 0, 2, 0, 1 };
+    static const int DX[7] = { 8, 8, 4, 4, 2, 2, 1 }, DY[7] = { 8, 8, 8, 4, 4, 2, 2 };
+    static const uint8_t sig[8] = { 137, 80, 78, 71, 13, 10, 26, 10 };
+    size_t pos = 8, zlen = 0, zpos = 0, rawn = 0;
+    uint32_t w = 0, h = 0;
+    int have_ihdr = 0, interlace = 0, channels, pass, npass, rc = 4, bpb, ntrns = 0;
+    CvFmt fm;
+    uint8_t *z = NULL, *raw = NULL;
+    uint32_t *out = NULL;
+    int pw[7], ph[7], prb[7];
+    size_t poff[7];
+
+    *px = NULL; *ow = *oh = 0;
+    memset(&fm, 0, sizeof fm);
+    if (fn < 8 + 25 || memcmp(f, sig, 8)) return 1;
+    /* 1a pasada: cabecera, paleta, transparencia y tamano del flujo comprimido */
+    while (pos + 12 <= fn) {
+        uint32_t len = cv_be32(f + pos);
+        const uint8_t *t = f + pos + 4, *d = f + pos + 8;
+        if (len > fn - pos - 12) { if (!have_ihdr) return 4; break; }
+        if (!memcmp(t, "IHDR", 4)) {
+            if (len < 13) return 4;
+            w = cv_be32(d); h = cv_be32(d + 4);
+            fm.depth = d[8]; fm.ct = d[9]; interlace = d[12];
+            if (d[10] != 0 || d[11] != 0 || interlace > 1) return 3;
+            have_ihdr = 1;
+        } else if (!memcmp(t, "PLTE", 4) && have_ihdr) {
+            uint32_t i;
+            fm.npal = (int)(len / 3);
+            if (fm.npal > 256) fm.npal = 256;
+            for (i = 0; i < (uint32_t)fm.npal; i++) { fm.pal[i][0] = d[i * 3]; fm.pal[i][1] = d[i * 3 + 1]; fm.pal[i][2] = d[i * 3 + 2]; }
+        } else if (!memcmp(t, "tRNS", 4) && have_ihdr && fm.ct == 3) {
+            uint32_t i;
+            for (i = 0; i < len && i < 256; i++) fm.pal[i][3] = d[i];
+            ntrns = (int)(len < 256 ? len : 256);
+        } else if (!memcmp(t, "IDAT", 4)) zlen += len;
+        else if (!memcmp(t, "IEND", 4)) break;
+        pos += 12 + (size_t)len;
+    }
+    if (!have_ihdr || zlen < 6) return 4;
+    if (w < 1 || h < 1 || w > CV_MAXDIM || h > CV_MAXDIM) return 2;
+    switch (fm.ct) {
+    case 0: if (fm.depth != 1 && fm.depth != 2 && fm.depth != 4 && fm.depth != 8 && fm.depth != 16) return 3; channels = 1; break;
+    case 2: if (fm.depth != 8 && fm.depth != 16) return 3; channels = 3; break;
+    case 3: if (fm.depth != 1 && fm.depth != 2 && fm.depth != 4 && fm.depth != 8) return 3; channels = 1; break;
+    case 4: if (fm.depth != 8 && fm.depth != 16) return 3; channels = 2; break;
+    case 6: if (fm.depth != 8 && fm.depth != 16) return 3; channels = 4; break;
+    default: return 3;
+    }
+    {   /* paleta: las entradas sin alfa explicito son opacas */
+        int i;
+        for (i = ntrns; i < 256; i++) fm.pal[i][3] = 255;
+        if (fm.ct == 3 && fm.npal == 0) return 4;
+    }
+    fm.bpp = channels * fm.depth;
+    bpb = fm.bpp >= 8 ? fm.bpp / 8 : 1;
+    /* tamano de los datos descomprimidos */
+    npass = interlace ? 7 : 1;
+    for (pass = 0; pass < npass; pass++) {
+        if (interlace) {
+            pw[pass] = (int)w > XO[pass] ? ((int)w - XO[pass] + DX[pass] - 1) / DX[pass] : 0;
+            ph[pass] = (int)h > YO[pass] ? ((int)h - YO[pass] + DY[pass] - 1) / DY[pass] : 0;
+        } else { pw[pass] = (int)w; ph[pass] = (int)h; }
+        prb[pass] = (pw[pass] * fm.bpp + 7) / 8;
+        poff[pass] = rawn;
+        if (pw[pass] > 0 && ph[pass] > 0) rawn += (size_t)ph[pass] * (size_t)(1 + prb[pass]);
+    }
+    if (rawn > CV_MAXRAW) return 2;
+    z = (uint8_t *)malloc(zlen);
+    raw = (uint8_t *)malloc(rawn ? rawn : 1);
+    out = (uint32_t *)malloc((size_t)w * h * 4);
+    if (!z || !raw || !out) { rc = 5; goto done; }
+    /* 2a pasada: juntar los IDAT */
+    pos = 8;
+    while (pos + 12 <= fn && zpos < zlen) {
+        uint32_t len = cv_be32(f + pos);
+        if (len > fn - pos - 12) break;
+        if (!memcmp(f + pos + 4, "IDAT", 4)) { memcpy(z + zpos, f + pos + 8, len); zpos += len; }
+        else if (!memcmp(f + pos + 4, "IEND", 4)) break;
+        pos += 12 + (size_t)len;
+    }
+    if (zpos != zlen) { rc = 4; goto done; }
+    if ((z[0] & 15) != 8 || (((unsigned)z[0] << 8) | z[1]) % 31 != 0 || (z[1] & 32)) { rc = 3; goto done; }
+    if (ci_inflate(z + 2, zlen - 2, raw, rawn) != 0) { rc = 4; goto done; }
+    for (pass = 0; pass < npass; pass++) {
+        uint8_t *pb = raw + poff[pass];
+        int x, y;
+        if (pw[pass] <= 0 || ph[pass] <= 0) continue;
+        if (cv_unfilter(pb, prb[pass], ph[pass], bpb)) { rc = 4; goto done; }
+        for (y = 0; y < ph[pass]; y++) {
+            const uint8_t *row = pb + (size_t)y * (size_t)(1 + prb[pass]) + 1;
+            for (x = 0; x < pw[pass]; x++) {
+                int dx = interlace ? XO[pass] + x * DX[pass] : x, dy = interlace ? YO[pass] + y * DY[pass] : y;
+                out[(size_t)dy * w + (size_t)dx] = cv_pixel(row, x, &fm, bg);
+            }
+        }
+    }
+    *px = out; *ow = (int)w; *oh = (int)h; out = NULL; rc = 0;
+done:
+    free(z); free(raw); free(out);
+    return rc;
+}
+
+/* Reduce (o agranda) src de sw x sh para que quepa en bw x bh sin deformar; deja el resultado en dst (bw*bh) y su tamano en *ow,*oh */
+static void cv_fit(const uint32_t *src, int sw, int sh, uint32_t *dst, int bw, int bh, int *ow, int *oh)
+{
+    int dw, dh, x, y;
+    if ((long)sw * bh > (long)sh * bw) { dw = bw; dh = (int)((long)sh * bw / sw); }
+    else { dh = bh; dw = (int)((long)sw * bh / sh); }
+    if (dw < 1) dw = 1;
+    if (dh < 1) dh = 1;
+    *ow = dw; *oh = dh;
+    for (y = 0; y < dh; y++) {
+        for (x = 0; x < dw; x++) {
+            uint32_t rr = 0, gg = 0, bb = 0;
+            if (dw < sw || dh < sh) {            /* achicar: promedio del rectangulo de origen */
+                int x0 = (int)((long)x * sw / dw), x1 = (int)((long)(x + 1) * sw / dw);
+                int y0 = (int)((long)y * sh / dh), y1 = (int)((long)(y + 1) * sh / dh), xx, yy, n;
+                if (x1 <= x0) x1 = x0 + 1;
+                if (y1 <= y0) y1 = y0 + 1;
+                if (x1 > sw) x1 = sw;
+                if (y1 > sh) y1 = sh;
+                n = (x1 - x0) * (y1 - y0);
+                for (yy = y0; yy < y1; yy++)
+                    for (xx = x0; xx < x1; xx++) {
+                        uint32_t p = src[(size_t)yy * sw + xx];
+                        rr += (p >> 16) & 255; gg += (p >> 8) & 255; bb += p & 255;
+                    }
+                rr /= (uint32_t)n; gg /= (uint32_t)n; bb /= (uint32_t)n;
+            } else {                              /* agrandar: bilineal */
+                long fx = dw > 1 ? (long)x * (sw - 1) * 256 / (dw - 1) : 0, fy = dh > 1 ? (long)y * (sh - 1) * 256 / (dh - 1) : 0;
+                int x0 = (int)(fx >> 8), y0 = (int)(fy >> 8), x1 = x0 + 1 < sw ? x0 + 1 : x0, y1 = y0 + 1 < sh ? y0 + 1 : y0;
+                int ax = (int)(fx & 255), ay = (int)(fy & 255), ch;
+                uint32_t p00 = src[(size_t)y0 * sw + x0], p10 = src[(size_t)y0 * sw + x1], p01 = src[(size_t)y1 * sw + x0], p11 = src[(size_t)y1 * sw + x1];
+                uint32_t v[3];
+                for (ch = 0; ch < 3; ch++) {
+                    int sft = 16 - 8 * ch;
+                    int a = (int)((p00 >> sft) & 255), b = (int)((p10 >> sft) & 255), c = (int)((p01 >> sft) & 255), d = (int)((p11 >> sft) & 255);
+                    int top = a * (256 - ax) + b * ax, bot = c * (256 - ax) + d * ax;
+                    v[ch] = (uint32_t)((top * (256 - ay) + bot * ay) >> 16);
+                }
+                rr = v[0]; gg = v[1]; bb = v[2];
+            }
+            dst[(size_t)y * bw + x] = 0xFF000000u | (rr << 16) | (gg << 8) | bb;
+        }
+    }
+}
+
+/* ---- v1.9.8: cuadro de caratula en ELEGIR ROM (carpeta USRDIR/covers, mismo nombre que la ROM, .png) ---- */
+#define CV_BX0 868            /* cuadro de la caratula (marco) */
+#define CV_BX1 1188
+#define CV_BY0 140
+#define CV_BY1 548
+#define CV_BW  312            /* area de imagen dentro del marco */
+#define CV_BH  400
+enum { CVS_PEND = 0, CVS_OK, CVS_NONE, CVS_BAD, CVS_BIG, CVS_UNSUP };
+static uint32_t g_cv_px[CV_BW * CV_BH];
+static int g_cv_w, g_cv_h, g_cv_state;
+static char g_cv_file[ROM_NAMELEN + 8];      /* nombre de la caratula esperada: <ROM sin .nes>.png */
+
+static int cv_lower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+static int cv_ceq(const char *a, const char *b, size_t n)     /* n caracteres iguales sin distinguir mayusculas */
+{
+    size_t i;
+    for (i = 0; i < n; i++) if (cv_lower((unsigned char)a[i]) != cv_lower((unsigned char)b[i])) return 0;
+    return 1;
+}
+/* largo del nombre sin la extension ".nes" (cualquier mayuscula/minuscula) */
+static size_t rom_base_len(const char *name)
+{
+    size_t n = strlen(name);
+    if (n > 4 && name[n - 4] == '.' && cv_ceq(name + n - 3, "nes", 3)) return n - 4;
+    return n;
+}
+static void rom_title(char *dst, size_t cap, const char *name)
+{
+    size_t n = rom_base_len(name);
+    if (n >= cap) n = cap - 1;
+    memcpy(dst, name, n);
+    dst[n] = 0;
+}
+/* recorta por ancho en pixeles (con "..."), sin partir un caracter UTF-8 */
+static void fit_px(char *dst, size_t cap, const char *src, int maxpx, int fs)
+{
+    size_t n;
+    snprintf(dst, cap, "%s", src);
+    if (hr_tw(dst, fs) <= maxpx) return;
+    n = strlen(dst);
+    while (n > 4) {
+        n--;
+        while (n > 4 && ((unsigned char)dst[n] & 0xC0) == 0x80) n--;
+        dst[n] = '.'; dst[n + 1] = '.'; dst[n + 2] = '.'; dst[n + 3] = 0;
+        if (hr_tw(dst, fs) <= maxpx) return;
+    }
+}
+/* busca en covers/ un .png que se llame como la ROM (sin distinguir mayusculas). 1 = lo encontro y deja la ruta en path */
+static int cv_find(const char *romname, char *path, size_t cap)
+{
+    char dir[300];
+    DIR *d;
+    struct dirent *e;
+    size_t bl = rom_base_len(romname);
+    int found = 0;
+    snprintf(dir, sizeof dir, "%s/covers", g_dir);
+    d = opendir(dir);
+    if (!d) return 0;
+    while ((e = readdir(d)) != NULL) {
+        size_t n = strlen(e->d_name);
+        if (n != bl + 4) continue;
+        if (!cv_ceq(e->d_name, romname, bl) || e->d_name[bl] != '.' || !cv_ceq(e->d_name + bl + 1, "png", 3)) continue;
+        snprintf(path, cap, "%s/%s", dir, e->d_name);
+        found = 1;
+        break;
+    }
+    closedir(d);
+    return found;
+}
+/* carga la caratula de la ROM g_roms[idx] (o deja el motivo en g_cv_state) */
+static void cv_update(int idx)
+{
+    char path[420];
+    uint8_t *b = NULL;
+    size_t bs = 0;
+    uint32_t *px = NULL;
+    int w = 0, h = 0, rc;
+    struct stat st;
+    snprintf(g_cv_file, sizeof g_cv_file, "%.*s.png", (int)rom_base_len(g_roms[idx].name), g_roms[idx].name);
+    g_cv_state = CVS_NONE;
+    if (!cv_find(g_roms[idx].name, path, sizeof path)) return;
+    if (stat(path, &st) != 0) return;
+    if ((unsigned long)st.st_size > CV_MAXFILE) { g_cv_state = CVS_BIG; logf_("caratula: %s pesa mas de 3 MB, no se muestra", g_cv_file); return; }
+    if (!read_whole_file(path, &b, &bs)) { g_cv_state = CVS_BAD; return; }
+    rc = cv_png_decode(b, bs, 0xFF02050Eu, &px, &w, &h);
+    free(b);
+    if (rc == 0) {
+        cv_fit(px, w, h, g_cv_px, CV_BW, CV_BH, &g_cv_w, &g_cv_h);
+        g_cv_state = CVS_OK;
+    } else {
+        g_cv_state = rc == 2 ? CVS_BIG : rc == 3 ? CVS_UNSUP : CVS_BAD;
+        logf_("caratula: %s no se pudo leer (codigo %d)", g_cv_file, rc);
+    }
+    free(px);
+}
+static void cv_draw(void)
+{
+    int cx = (CV_BX0 + CV_BX1) / 2, y, x0, y0;
+    char t[ROM_NAMELEN + 8];
+    hr_rect(CV_BX0, CV_BY0, CV_BX1, CV_BY1, 0xFF02050Eu, 256);
+    hr_frame_rect(CV_BX0, CV_BY0, CV_BX1, CV_BY1, 2, HC_GRID);
+    if (g_cv_state == CVS_PEND) return;
+    if (g_cv_state == CVS_OK) {
+        x0 = CV_BX0 + 4 + (CV_BW - g_cv_w) / 2;
+        y0 = CV_BY0 + 4 + (CV_BH - g_cv_h) / 2;
+        for (y = 0; y < g_cv_h; y++) memcpy(&g_hr[(y0 + y) * HR_W + x0], &g_cv_px[(size_t)y * CV_BW], (size_t)g_cv_w * 4);
+        return;
+    }
+    hr_textc(cx, 330, g_cv_state == CVS_NONE ? "Sin carátula" : g_cv_state == CVS_BIG ? "PNG muy grande" : g_cv_state == CVS_UNSUP ? "PNG no compatible" : "PNG inválido", FS_M, HC_DIM);
+    if (g_cv_state == CVS_BIG) hr_textc(cx, 372, "máx. 1024 px y 3 MB", FS_S, HC_DIM);
+    else hr_textc(cx, 372, g_cv_state == CVS_NONE ? "Pon en la carpeta covers:" : "Revisa el archivo:", FS_S, HC_DIM);
+    fit_px(t, sizeof t, g_cv_file, CV_BW - 8, FS_S);
+    hr_textc(cx, 408, t, FS_S, HC_YEL);
+}
+
 /* Selector de ROM: lista de USRDIR/roms. 1 = eligio y cargo una ROM, 0 = volvio sin elegir.
  * v1.9.2: con pick_only = 1 (el host en plena partida online) NO carga nada: deja nombre, CRC32 y tamano de la ROM elegida
  * en g_pick_* y devuelve 1; la partida sigue en marcha por debajo (ver gsw_ask_host). */
@@ -5710,6 +6252,8 @@ static int ui_rom_select(int pick_only)
     int sel = 0, top = 0, i, last_sel = -1, hold = 0;
     g_stage = "elegir-rom";
     roms_scan();
+    { char cdir[300]; snprintf(cdir, sizeof cdir, "%s/covers", g_dir); mkdir(cdir, 0777); }   /* v1.9.8: carpeta de caratulas */
+    g_cv_state = CVS_PEND;
     for (i = 0; i < g_nroms; i++) if (g_rom_name[0] && !strcmp(g_roms[i].name, g_rom_name)) sel = i;
     while (g_running) {
         uint16_t e;
@@ -5747,8 +6291,9 @@ static int ui_rom_select(int pick_only)
             if (sel < top) top = sel;
             if (sel >= top + VIS) top = sel - VIS + 1;
             /* v1.9: el CRC32 se calcula cuando el cursor se queda ~0,2 s sobre una ROM (no al pasar rapido) */
-            if (sel != last_sel) { last_sel = sel; hold = 0; }
+            if (sel != last_sel) { last_sel = sel; hold = 0; g_cv_state = CVS_PEND; }
             else if (hold < 1000) hold++;
+            if (hold == 12 && hr_usable()) cv_update(sel);       /* v1.9.8: la caratula se carga cuando el cursor se queda ~0,2 s */
             if (hold == 12 && !g_roms[sel].has_crc) {
                 uint8_t *b = NULL;
                 size_t bs = 0;
@@ -5774,15 +6319,18 @@ static int ui_rom_select(int pick_only)
                 hr_panel(70, 124, 1210, 558);
                 for (i = 0; i < VIS && top + i < g_nroms; i++) {
                     int k = top + i, yy = 138 + i * 46;
-                    fit_name(nm, sizeof nm, g_roms[k].name, 52);
+                    char tt[ROM_NAMELEN + 4], nm2[ROM_NAMELEN + 4];
+                    rom_title(tt, sizeof tt, g_roms[k].name);            /* v1.9.8: sin ".nes" y recortado por ancho */
+                    fit_px(nm2, sizeof nm2, tt, 700, FS_L);
                     if (k == sel) {
-                        hr_rect(86, yy, 1194, yy + 42, HC_RED, 256);
+                        hr_rect(86, yy, 852, yy + 42, HC_RED, 256);
                         hr_tri(100, yy + 21, 22);
-                        hr_text(132, yy + 31, nm, FS_L, HC_WHITE, 2);
-                    } else hr_text(132, yy + 31, nm, FS_L, HC_DIM, 2);
+                        hr_text(132, yy + 31, nm2, FS_L, HC_WHITE, 2);
+                    } else hr_text(132, yy + 31, nm2, FS_L, HC_DIM, 2);
                 }
-                if (top > 0) hr_arrow(1176, 156, 1);
-                if (top + VIS < g_nroms) hr_arrow(1176, 536, 0);
+                if (top > 0) hr_arrow(838, 156, 1);
+                if (top + VIS < g_nroms) hr_arrow(838, 536, 0);
+                cv_draw();
                 hr_panel(70, 568, 1210, 656);
                 fit_name(nm, sizeof nm, g_roms[sel].name, 60);
                 hr_text(96, 604, nm, FS_M, HC_YEL, 2);
@@ -6335,7 +6883,7 @@ static int ui_menu(void)
             continue;
         }
         ui_clear();
-        ui_center(20, "NESNET V1.9.7", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.8", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         if (g_rom) {
             fit_name(nm, sizeof nm, g_rom_name, 34);
@@ -6393,7 +6941,7 @@ static int ui_menu4(void)
             continue;
         }
         ui_clear();
-        ui_center(20, "NESNET V1.9.7", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.8", 2, 0xFFFFD040);
         ui_center(46, "MULTIJUGADOR DE 4 (FOUR SCORE)", 1, 0xFFC0C0FF);
         ui_center(66, "HOST: MANDOS 1 Y 2", 1, 0xFF80FF80);
         ui_center(80, "EL QUE SE UNE: MANDOS 3 Y 4", 1, 0xFF80FF80);
@@ -6468,7 +7016,7 @@ static int ui_enter_code(char *out)
             continue;
         }
         ui_clear();
-        ui_center(20, "NESNET V1.9.7", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.8", 2, 0xFFFFD040);
         ui_center(60, "ESCRIBE EL CODIGO DEL HOST", 1, 0xFFFFFFFF);
         for (i = 0; i < 10; i++) {
             char c[2] = { (char)('0' + d[i]), 0 };
@@ -6574,7 +7122,7 @@ static int run_host_inner(void)
             present();
         } else {
         ui_clear();
-        ui_center(20, "NESNET V1.9.7", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.8", 2, 0xFFFFD040);
         ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
         { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -6725,7 +7273,7 @@ static int run_host4_inner(void)
             present();
         } else {
         ui_clear();
-        ui_center(20, "NESNET V1.9.7", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.8", 2, 0xFFFFD040);
         ui_center(64, "SALA DE 4 - TU CODIGO:", 1, 0xFFFFFFFF);
         { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
         ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
@@ -6831,7 +7379,7 @@ static void app_prepare(const char *argv0)
         rename(p, q);                     /* conserva el log de la vez anterior */
         g_log = fopen(p, "w");
     }
-    logf_("NesNet v1.9.7 (menus en 1280x720 con fuente DejaVu Bold y fondo mosaico; L2 = captura de pantalla limpia en PNG; menu en partida con R3; 6 ranuras de estado; guardar/cargar estado online (host); O sale al XMB; menus siempre a pantalla completa; codigo de sala guardado al unirse) - dir=%s", g_dir);
+    logf_("NesNet v1.9.8 (caratulas en ELEGIR ROM (USRDIR/covers, .png); menus en 1280x720 con fuente DejaVu Bold y fondo mosaico; L2 = captura de pantalla limpia en PNG; menu en partida con R3; 6 ranuras de estado; guardar/cargar estado online (host); O sale al XMB; menus siempre a pantalla completa; codigo de sala guardado al unirse) - dir=%s", g_dir);
     cfg_load();
     logf_("config: res=%d render=%s zoom=%d audio=%s", g_cfg.res, g_cfg.render ? "cpu" : "gpu", g_cfg.zoom, g_cfg.audio ? "on" : "off");
     opts_load();                          /* v1.8.2: pantalla y mandos guardados en opciones.txt */
@@ -6969,7 +7517,7 @@ int main(int argc, char **argv)
         static const char *items[3] = { "CREAR SALA (HOST)", "UNIRSE A UNA SALA", "SOLO - 2 MANDOS" };
         int i;
         ui_clear();
-        ui_center(20, "NESNET V1.9.7", 2, 0xFFFFD040);
+        ui_center(20, "NESNET V1.9.8", 2, 0xFFFFD040);
         ui_center(46, "NES CON NETPLAY PARA PS3", 1, 0xFFC0C0FF);
         for (i = 0; i < 3; i++) {
             char line[40];
@@ -6982,7 +7530,7 @@ int main(int argc, char **argv)
             code_encode(((uint32_t)181 << 24) | (45u << 16) | (200u << 8) | 17u, 7777, code);
             if (hr_usable()) hr_room_screen("SALA DE 4 (HOST)", code, "puerto 7777", "UPNP: PUERTO ABIERTO", 0xFF80FF80u); else {
             ui_clear();
-            ui_center(20, "NESNET V1.9.7", 2, 0xFFFFD040);
+            ui_center(20, "NESNET V1.9.8", 2, 0xFFFFD040);
             ui_center(64, "TU CODIGO DE SALA:", 1, 0xFFFFFFFF);
             { char pc[24]; code_pretty(code, pc); ui_center(84, pc, 2, 0xFFFFFF40); }
             ui_center(116, "DASELO A TU AMIGO", 1, 0xFFC0C0FF);
